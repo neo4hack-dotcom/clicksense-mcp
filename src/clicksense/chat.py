@@ -16,7 +16,6 @@ import json
 import os
 import sys
 import warnings
-from pathlib import Path
 
 import anyio
 
@@ -24,19 +23,6 @@ from .agent import Agent, connect, resolve_base_url
 from .config import ConfigError, load_settings
 
 HELP = "/reset new conversation · /tools list tools · /exit quit"
-
-
-def load_dotenv(*dirs: Path) -> None:
-    for d in dirs:
-        f = d / ".env"
-        if not f.is_file():
-            continue
-        for line in f.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.removeprefix("export ").partition("=")
-            os.environ.setdefault(key.strip(), value.strip().strip("'\""))
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -50,8 +36,6 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--quiet", action="store_true", help="Hide the tool-call trace.")
     args = ap.parse_args(argv)
 
-    cfg = Path(args.config or os.environ.get("CLICKSENSE_CONFIG") or "clicksense.yaml")
-    load_dotenv(cfg.resolve().parent, Path.cwd())
     warnings.filterwarnings("ignore")
     import logging
 
@@ -146,3 +130,7 @@ class _null:
 
     def __exit__(self, *a):
         return False
+
+
+if __name__ == "__main__":
+    main()

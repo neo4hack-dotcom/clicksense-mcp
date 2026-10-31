@@ -103,13 +103,15 @@ def elicitation_handler(ask_user: AskUser):
 async def connect(settings: Settings, ask_user: AskUser | None = None) -> AsyncIterator[Client]:
     """An MCP client on ClickSense: in-process by default, or over HTTP when llm.mcp_url is set."""
     handler = elicitation_handler(ask_user) if ask_user else None
+    auth = None
     if settings.llm.mcp_url:
         target: Any = settings.llm.mcp_url
+        auth = settings.llm.mcp_token
     else:
         from .server import build_app
 
         target = build_app(settings)
-    async with Client(target, elicitation_handler=handler) as client:
+    async with Client(target, elicitation_handler=handler, auth=auth) as client:
         yield client
 
 
