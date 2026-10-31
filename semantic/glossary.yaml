@@ -1,0 +1,59 @@
+# Business glossary. A term with several `senses` is ambiguous: get_context flags it and the
+# agent must settle it (from the question's context or by asking) before querying.
+terms:
+  - term: sales
+    synonyms: [sales figures]
+    definition: Ambiguous word — it can mean money, orders or units.
+    senses:
+      - meaning: Revenue in EUR (metric revenue)
+        maps_to: "metric:revenue"
+      - meaning: Number of orders (metric orders)
+        maps_to: "metric:orders"
+      - meaning: Units sold (metric units_sold)
+        maps_to: "metric:units_sold"
+
+  - term: CA
+    synonyms: [C.A.]
+    definition: Ambiguous abbreviation.
+    senses:
+      - meaning: Canada (ISO country code 'CA')
+        maps_to: "shop.orders.country = 'CA'"
+      - meaning: Revenue (French "chiffre d'affaires", common in French-speaking teams)
+        maps_to: "metric:revenue"
+
+  - term: revenue
+    synonyms: [turnover, gross revenue, GMV, chiffre d'affaires]
+    definition: Sum of amounts including VAT of delivered order lines (status = 'completed').
+    maps_to: "metric:revenue"
+
+  - term: average order value
+    synonyms: [AOV, basket size, average basket, panier moyen]
+    definition: Revenue divided by the number of delivered order lines.
+    maps_to: "metric:average_order_value"
+
+  - term: active customer
+    synonyms: [active customers, active buyers]
+    definition: Customer with at least one delivered order in the period studied.
+    maps_to: "metric:active_customers"
+
+  - term: cancellation rate
+    synonyms: [cancel rate, cancellations]
+    definition: Share of cancelled order lines among all order lines of the period.
+    maps_to: "metric:cancellation_rate"
+
+  - term: conversion rate
+    synonyms: [conversion, CVR]
+    definition: Sessions with at least one purchase divided by all sessions.
+    maps_to: "metric:conversion_rate"
+
+  - term: country
+    definition: Ambiguous between the delivery country and the customer's country.
+    senses:
+      - meaning: Delivery country of the order
+        maps_to: "shop.orders.country"
+      - meaning: Customer's country of residence
+        maps_to: "shop.customers.country (dimension customer_country)"
+
+  - term: customer
+    definition: Depending on context, an account (shop.customers) or a buyer in a period.
+    maps_to: "shop.customers"

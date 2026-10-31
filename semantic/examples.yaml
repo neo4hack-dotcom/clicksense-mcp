@@ -1,0 +1,34 @@
+# Verified question -> SQL pairs. get_context returns the closest ones as few-shot examples.
+examples:
+  - question: Monthly revenue in France for the current year
+    tags: [revenue, monthly, country]
+    sql: |
+      SELECT toStartOfMonth(order_date) AS month, sum(amount_eur) AS revenue
+      FROM shop.orders
+      WHERE status = 'completed' AND country = 'FR' AND order_date >= toStartOfYear(today())
+      GROUP BY month ORDER BY month
+  - question: Top 10 products by revenue last month
+    tags: [top, products, revenue]
+    sql: |
+      SELECT p.name, sum(o.amount_eur) AS revenue
+      FROM shop.orders AS o
+      INNER JOIN shop.products AS p ON o.product_id = p.product_id
+      WHERE o.status = 'completed'
+        AND o.order_date >= toStartOfMonth(today() - toIntervalMonth(1))
+        AND o.order_date < toStartOfMonth(today())
+      GROUP BY p.name ORDER BY revenue DESC LIMIT 10
+    notes: The JOIN puts the small table (products, 5k rows) on the right.
+  - question: Conversion rate by device over the last 7 days
+    tags: [conversion, web, device]
+    sql: |
+      SELECT device, uniqIf(session_id, event_type = 'purchase') / uniq(session_id) AS conversion_rate
+      FROM shop.web_events
+      WHERE event_date >= today() - 6
+      GROUP BY device ORDER BY conversion_rate DESC
+  - question: Number of VIP customers by country
+    tags: [customers, segment, country]
+    sql: |
+      SELECT country, count() AS customers
+      FROM shop.customers
+      WHERE segment = 'VIP'
+      GROUP BY country ORDER BY customers DESC

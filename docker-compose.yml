@@ -1,0 +1,16 @@
+# Same dev database as scripts/dev-clickhouse.sh, for machines with Docker.
+#   docker compose up -d && docker compose exec -T clickhouse clickhouse-client --multiquery < dev/seed.sql
+# HTTP is published on 18123 so clicksense.example.yaml works unchanged.
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    ports:
+      - "18123:8123"
+      - "19000:9000"
+    volumes:
+      - ./dev/clickhouse/users.xml:/etc/clickhouse-server/users.d/clicksense.xml:ro
+      - chdata:/var/lib/clickhouse
+    ulimits:
+      nofile: {soft: 262144, hard: 262144}
+volumes:
+  chdata:

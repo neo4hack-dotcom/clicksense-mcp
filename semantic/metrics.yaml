@@ -1,0 +1,83 @@
+# Governed metrics. query_metric compiles these; the model never re-invents the formula.
+# expression: an aggregate over the metric table (alias from the dictionary, `o` for orders).
+# filters: SQL conditions always applied. dimensions: allowed group-by/filter dimensions
+# (columns of the metric table are always allowed in addition).
+metrics:
+  - name: revenue
+    label: Revenue
+    description: Sum of amounts including VAT of delivered order lines.
+    table: shop.orders
+    expression: sum(o.amount_eur)
+    filters: ["o.status = 'completed'"]
+    time_column: order_date
+    unit: EUR
+    synonyms: [turnover, gross revenue, gmv, chiffre d'affaires]
+    dimensions: [country, channel, category, brand, segment, customer_country, city, status]
+
+  - name: orders
+    label: Orders
+    description: Number of delivered order lines.
+    table: shop.orders
+    expression: count()
+    filters: ["o.status = 'completed'"]
+    time_column: order_date
+    synonyms: [number of orders, order count, order volume]
+    dimensions: [country, channel, category, brand, segment, customer_country, city]
+
+  - name: average_order_value
+    label: Average order value
+    description: Revenue / number of delivered order lines.
+    table: shop.orders
+    expression: round(sum(o.amount_eur) / count(), 2)
+    filters: ["o.status = 'completed'"]
+    time_column: order_date
+    unit: EUR
+    synonyms: [aov, average basket, basket size, panier moyen]
+    dimensions: [country, channel, category, segment, customer_country]
+
+  - name: active_customers
+    label: Active customers
+    description: Distinct customers with at least one delivered order.
+    table: shop.orders
+    expression: uniqExact(o.customer_id)
+    filters: ["o.status = 'completed'"]
+    time_column: order_date
+    synonyms: [active buyers, buyers, unique customers]
+    dimensions: [country, channel, category, segment, customer_country, city]
+
+  - name: units_sold
+    label: Units sold
+    description: Sum of quantities of delivered order lines.
+    table: shop.orders
+    expression: sum(o.quantity)
+    filters: ["o.status = 'completed'"]
+    time_column: order_date
+    synonyms: [units, quantity sold, volume]
+    dimensions: [country, channel, category, brand, segment]
+
+  - name: cancellation_rate
+    label: Cancellation rate
+    description: Share of cancelled lines among all lines (every status).
+    table: shop.orders
+    expression: round(countIf(o.status = 'cancelled') / count(), 4)
+    time_column: order_date
+    synonyms: [cancel rate, cancellations]
+    dimensions: [country, channel, category, segment]
+
+  - name: sessions
+    label: Sessions
+    description: Number of distinct sessions.
+    table: shop.web_events
+    expression: uniq(e.session_id)
+    time_column: event_date
+    synonyms: [visits, traffic]
+    dimensions: [device, event_type]
+
+  - name: conversion_rate
+    label: Conversion rate
+    description: Sessions with a purchase / sessions.
+    table: shop.web_events
+    expression: round(uniqIf(e.session_id, e.event_type = 'purchase') / uniq(e.session_id), 4)
+    time_column: event_date
+    synonyms: [conversion, cvr]
+    dimensions: [device]

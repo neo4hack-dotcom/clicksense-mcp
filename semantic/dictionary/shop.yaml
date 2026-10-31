@@ -1,0 +1,161 @@
+# Data dictionary — database `shop`.
+# ClickHouse stays the source of truth for what exists (types, keys, sizes are read live);
+# this file adds what only people know. Every key is optional.
+#
+# Table keys:   description, grain, alias (used by query_metric), time_column, owner, tags,
+#               synonyms, caveats, refresh, joins, dimensions, columns
+# Column keys:  description, unit, pii, synonyms, values {stored: label},
+#               value_synonyms {stored: [user words]}, values_complete, enumerable, caveats
+#
+# Synonyms are user vocabulary, not documentation: they may be multilingual. A few French
+# words are kept on purpose to show that the resolver maps any wording to stored values.
+
+tables:
+  shop.orders:
+    description: Order lines (one row per product per order), all channels.
+    grain: one row per ordered product
+    alias: o
+    time_column: order_date
+    owner: Sales Data team
+    refresh: daily, around 06:00 Europe/Paris (previous day complete)
+    tags: [sales, orders, revenue]
+    synonyms: [orders, sales, purchases, transactions, commandes, ventes]
+    caveats:
+      - amount_eur includes VAT. For net amounts divide by 1.2 (approximation, French VAT).
+      - Official revenue only counts status = 'completed'.
+      - country is the DELIVERY country, not the customer's country (see customers.country).
+    joins:
+      customers: {table: shop.customers, alias: c, on: "o.customer_id = c.customer_id", relationship: many_to_one}
+      products: {table: shop.products, alias: p, on: "o.product_id = p.product_id", relationship: many_to_one}
+    dimensions:
+      category: {sql: p.category, join: products, column: shop.products.category, description: Product category}
+      brand: {sql: p.brand, join: products, column: shop.products.brand, description: Brand}
+      segment: {sql: c.segment, join: customers, column: shop.customers.segment, description: Customer segment}
+      customer_country: {sql: c.country, join: customers, column: shop.customers.country,
+                         description: Customer's country of residence (not the delivery country)}
+      city: {sql: c.city, join: customers, column: shop.customers.city, description: Customer's city}
+    columns:
+      order_id: {description: Order line identifier}
+      order_date: {description: Order date (partition key), synonyms: [date, day]}
+      order_ts: {description: Order timestamp, Paris time}
+      customer_id: {description: Customer (FK shop.customers)}
+      product_id: {description: Product (FK shop.products)}
+      quantity: {description: Units ordered, unit: units, synonyms: [quantity, qty, volume, units]}
+      amount_eur:
+        description: Line amount including VAT
+        unit: EUR
+        synonyms: [amount, price, value, sales amount, montant]
+      status:
+        description: Order status
+        synonyms: [state, order status]
+        values:
+          completed: Delivered and paid
+          cancelled: Cancelled before shipping
+          refunded: Refunded after delivery
+          pending: Awaiting payment
+        value_synonyms:
+          completed: [delivered, complete, paid, fulfilled, done, livrée, livrées]
+          cancelled: [canceled, cancellation, cancellations, annulée, annulées]
+          refunded: [refund, refunds, returned, return, remboursée, remboursement]
+          pending: [awaiting payment, unpaid, in progress, en attente]
+      channel:
+        description: Sales channel
+        synonyms: [channel, source]
+        values: {web: Website, app: Mobile app, store: Physical store, marketplace: Marketplaces}
+        value_synonyms:
+          web: [website, site, online, internet, ecommerce, e-commerce]
+          app: [application, mobile app, mobile, appli]
+          store: [shop, brick and mortar, physical, retail store, magasin]
+          marketplace: [marketplaces, amazon, third party]
+      country:
+        description: Delivery country (ISO 3166-1 alpha-2)
+        synonyms: [country, delivery country, pays]
+        values: &countries
+          FR: France
+          BE: Belgium
+          CH: Switzerland
+          DE: Germany
+          ES: Spain
+          IT: Italy
+          CA: Canada
+          US: United States
+          GB: United Kingdom
+        value_synonyms: &country_syn
+          FR: [french, france]
+          BE: [belgian, belgique]
+          CH: [swiss, suisse]
+          DE: [german, allemagne]
+          ES: [spanish, espagne]
+          IT: [italian, italie]
+          CA: [canadian]
+          US: [usa, u.s., america, united states of america]
+          GB: [uk, u.k., britain, great britain, england]
+
+  shop.customers:
+    description: Customer accounts.
+    grain: one customer
+    alias: c
+    owner: CRM team
+    synonyms: [customers, clients, buyers, accounts]
+    columns:
+      customer_id: {description: Customer identifier}
+      name: {description: Full name, pii: true, synonyms: [name, customer name]}
+      email: {description: Email address, pii: true}
+      country:
+        description: Customer's country of residence (ISO alpha-2)
+        values: *countries
+        value_synonyms: *country_syn
+      city: {description: Customer's city, enumerable: true, synonyms: [city, town]}
+      segment:
+        description: Commercial segment
+        values: {B2C: Consumer, B2B: Business, VIP: Premium customer}
+        value_synonyms:
+          B2C: [consumer, consumers, individual, retail customers, particulier]
+          B2B: [business, businesses, pro, professional, company, companies, corporate]
+          VIP: [premium, top customers]
+      signup_date: {description: Account creation date, synonyms: [signup, registration date]}
+
+  shop.products:
+    description: Product catalogue.
+    grain: one product
+    alias: p
+    synonyms: [products, items, articles, catalogue, catalog]
+    columns:
+      name: {description: Product name}
+      category:
+        description: Product category
+        synonyms: [category, department, product family]
+        value_synonyms:
+          Home Appliances: [appliances, white goods, électroménager]
+          Computers: [computing, pc, laptops, it]
+          Phones: [smartphones, mobiles, telephony, cell phones]
+          Video Games: [games, gaming, consoles]
+          Home & Living: [home, house, living, furniture]
+      brand: {description: Brand, synonyms: [brand, make]}
+      unit_price: {description: Current list price including VAT, unit: EUR,
+                   caveats: [Current price, not the price at order time (use orders.amount_eur)]}
+
+  shop.web_events:
+    description: Website and app clickstream (page views, add-to-cart, checkout, purchases).
+    grain: one event
+    alias: e
+    time_column: event_date
+    refresh: near real time (a few minutes of latency)
+    synonyms: [traffic, clickstream, browsing, events, sessions, visits]
+    caveats:
+      - customer_id = 0 for anonymous visitors.
+      - One session = one session_id; count sessions with uniq(session_id).
+    columns:
+      event_type:
+        description: Event type
+        values: {page_view: Page view, add_to_cart: Add to cart, checkout: Checkout started, purchase: Purchase}
+        value_synonyms:
+          page_view: [view, views, page views, pageview]
+          add_to_cart: [add to basket, cart, basket]
+          purchase: [purchases, buy, conversion, order]
+      device:
+        description: Device type
+        values: {desktop: Desktop, mobile: Mobile, tablet: Tablet}
+        value_synonyms: {desktop: [computer, pc, laptop], tablet: [ipad], mobile: [smartphone, phone]}
+      session_id: {description: Session identifier, synonyms: [session, visit]}
+      page: {description: Page path}

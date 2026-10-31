@@ -1,0 +1,83 @@
+<!-- The real safety boundary is HERE, not in the MCP server.
+     `clicksense` is a read-only account whose profile caps time, memory, threads and
+     rows read, and whose CONSTRAINTS stop a client (or a model) from raising them.
+     The MCP server sends tighter per-query settings on top; it can lower these, never
+     exceed them. Copy this profile/quota to production and change the password. -->
+<clickhouse>
+    <profiles>
+        <default>
+            <max_memory_usage>4000000000</max_memory_usage>
+        </default>
+
+        <clicksense_ro>
+            <!-- 2 = read data + change settings (needed to send per-query limits). -->
+            <readonly>2</readonly>
+            <allow_ddl>0</allow_ddl>
+            <allow_introspection_functions>0</allow_introspection_functions>
+            <max_execution_time>30</max_execution_time>
+            <timeout_overflow_mode>throw</timeout_overflow_mode>
+            <max_memory_usage>2000000000</max_memory_usage>
+            <max_threads>4</max_threads>
+            <max_rows_to_read>2000000000</max_rows_to_read>
+            <max_bytes_to_read>200000000000</max_bytes_to_read>
+            <max_result_rows>1000000</max_result_rows>
+            <max_concurrent_queries_for_user>8</max_concurrent_queries_for_user>
+            <!-- Lower priority than interactive/ETL users: higher number = lower priority. -->
+            <priority>5</priority>
+            <max_bytes_before_external_group_by>1000000000</max_bytes_before_external_group_by>
+            <max_bytes_before_external_sort>1000000000</max_bytes_before_external_sort>
+            <cancel_http_readonly_queries_on_client_close>1</cancel_http_readonly_queries_on_client_close>
+            <constraints>
+                <max_execution_time><max>60</max></max_execution_time>
+                <max_memory_usage><max>4000000000</max></max_memory_usage>
+                <max_threads><max>8</max></max_threads>
+                <max_rows_to_read><max>5000000000</max></max_rows_to_read>
+                <max_bytes_to_read><max>500000000000</max></max_bytes_to_read>
+                <priority><min>5</min></priority>
+                <max_concurrent_queries_for_user><max>8</max></max_concurrent_queries_for_user>
+                <allow_ddl><const/></allow_ddl>
+                <allow_introspection_functions><const/></allow_introspection_functions>
+            </constraints>
+        </clicksense_ro>
+    </profiles>
+
+    <quotas>
+        <default>
+            <interval><duration>3600</duration><queries>0</queries><errors>0</errors>
+                <result_rows>0</result_rows><read_rows>0</read_rows><execution_time>0</execution_time></interval>
+        </default>
+        <clicksense_quota>
+            <interval>
+                <duration>3600</duration>
+                <queries>5000</queries>
+                <errors>1000</errors>
+                <read_rows>200000000000</read_rows>
+                <execution_time>7200</execution_time>
+            </interval>
+        </clicksense_quota>
+    </quotas>
+
+    <users>
+        <!-- Admin for seeding only. Local dev: no password, localhost only. -->
+        <default>
+            <password></password>
+            <networks><ip>127.0.0.1</ip><ip>::1</ip></networks>
+            <profile>default</profile>
+            <quota>default</quota>
+            <access_management>0</access_management>
+        </default>
+
+        <clicksense>
+            <!-- DEV ONLY. In production use password_sha256_hex. -->
+            <password>clicksense</password>
+            <networks><ip>::/0</ip></networks>
+            <profile>clicksense_ro</profile>
+            <quota>clicksense_quota</quota>
+            <grants>
+                <query>GRANT SELECT ON shop.*</query>
+                <!-- Catalog introspection (system.tables / system.columns are readable by default). -->
+                <query>GRANT SELECT ON system.data_skipping_indices</query>
+            </grants>
+        </clicksense>
+    </users>
+</clickhouse>

@@ -1,0 +1,40 @@
+# ClickSense configuration. Copy to clicksense.yaml (git-ignored). ${VAR} and ${VAR:-default}
+# are read from the environment; a missing variable without default stops the server.
+connection:
+  host: ${CLICKSENSE_HOST:-localhost}
+  port: ${CLICKSENSE_PORT:-18123}          # HTTP interface (8123 / 8443 in production)
+  username: ${CLICKSENSE_USER:-clicksense}  # a read-only account, see dev/clickhouse/users.xml
+  password: ${CLICKSENSE_PASSWORD:-clicksense}
+  secure: false
+  database: shop                            # default database for unqualified table names
+  pool_size: 8
+  compress: lz4
+
+limits:                       # per query; can only tighten the ClickHouse profile
+  default_rows: 200
+  hard_max_rows: 5000
+  max_response_bytes: 200000
+  max_execution_time: 20      # seconds
+  max_memory_usage: 1000000000
+  max_threads: 4
+  max_rows_to_read: 1000000000
+  preflight: true             # EXPLAIN ESTIMATE before running queries on big tables
+  preflight_max_rows: 300000000
+  max_concurrent: 4           # client-side slots: protects ClickHouse from bursts
+  rate_per_minute: 240
+  breaker_failures: 4         # consecutive timeouts/OOM/network -> pause
+  breaker_cooldown_s: 30
+  result_cache_ttl_s: 120
+  use_query_cache: true       # ClickHouse query cache (>= 23.x)
+
+policy:
+  allowed_databases: [shop]
+  denied_tables: []
+  allowed_table_functions: [numbers]
+  pii: block                  # PII columns can be filtered/aggregated, never returned raw
+  server_parse_fallback: true
+
+semantic_dir: semantic
+audit_path: audit/clicksense.jsonl
+catalog_ttl_s: 600
+value_cache_ttl_s: 3600
