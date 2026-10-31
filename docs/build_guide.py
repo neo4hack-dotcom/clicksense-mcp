@@ -340,6 +340,51 @@ table([["Option", "Default", "Meaning"],
        ["--transport", "stdio", "stdio or http."],
        ["--host / --port", "127.0.0.1 / 3110", "HTTP bind address."],
        ["--check", "off", "Print the status report and exit."]], [35, 60, 75])
+p("clicksense-chat takes --config, -q/--question, --model, --base-url, --mcp-url and --quiet (section 2.7).", SMALL)
+
+h2("2.7 Use an OpenAI-compatible LLM with your own API key")
+p("The LLM does not need to support MCP. <font face='Courier'>clicksense-chat</font> is the MCP client in between: "
+  "it lists the ClickSense tools, gives them to any OpenAI-compatible chat-completions API as function tools, "
+  "runs the calls the model makes and loops until the model answers. Works with OpenAI, Azure OpenAI, Mistral, "
+  "Groq, DeepSeek, OpenRouter, vLLM, Ollama, LM Studio and others.")
+code("""
+uv pip install --python .venv/bin/python -e ".[llm]"
+cp .env.example .env              # put your key in it: OPENAI_API_KEY=sk-...
+.venv/bin/clicksense-chat         # interactive: /reset, /tools, /exit
+.venv/bin/clicksense-chat -q "Revenue by channel in France last month"
+.venv/bin/clicksense-chat --base-url https://api.mistral.ai/v1 --model mistral-large-latest
+.venv/bin/clicksense-chat --mcp-url http://127.0.0.1:3110/mcp   # use a running HTTP server
+""")
+table([["Setting", "Where", "Meaning"],
+       ["API key", "OPENAI_API_KEY or CLICKSENSE_LLM_API_KEY (env or .env), or llm.api_key",
+        "Not needed for local servers (localhost)."],
+       ["Endpoint", "--base-url, llm.base_url or OPENAI_BASE_URL", "Default https://api.openai.com/v1."],
+       ["Model", "--model, CLICKSENSE_LLM_MODEL or llm.model", "Default gpt-4.1-mini. Must support tool calling."]],
+      [25, 75, 70])
+bullets(["<b>auto_context</b> (default on): before each question the bridge calls <font face='Courier'>get_context</font> "
+         "itself and puts the result in the conversation. Models other than Claude often skip \"call this first\" "
+         "instructions; without it, an ambiguous word such as \"sales\" can be resolved silently. Tested: with it, the "
+         "model asks which meaning of \"sales\" is wanted before querying.",
+         "<b>Clarification</b>: when the model calls <font face='Courier'>ask_user_to_clarify</font>, the question and "
+         "its numbered options are shown in the terminal.",
+         "<b>Bounded</b>: at most llm.max_steps tool rounds per question; tool results above llm.max_tool_chars are "
+         "truncated with a note asking the model to aggregate.",
+         "<b>History</b>: follow-up questions keep the conversation; /reset starts over."])
+p("In your own Python code:")
+code("""
+from clicksense.agent import Agent, connect
+from clicksense.config import load_settings
+
+settings = load_settings("clicksense.yaml")
+async with connect(settings, ask_user=my_async_ask) as client:   # ask_user(question, options) -> str | None
+    agent = Agent(settings.llm, client, on_event=lambda kind, data: print(kind, data))
+    await agent.start()
+    answer = await agent.ask("What was revenue in France last month?")
+""")
+callout("Data leaves your network", "Tool results (schema, sampled values, query results) are sent to the LLM "
+        "provider you configure. Use a provider and contract that fit the data's sensitivity, or a local server "
+        "(vLLM, Ollama with a local model). PII columns are never returned raw by ClickSense under policy pii: block.",
+        WARN_SOFT, colors.HexColor("#c2410c"))
 
 # ============================================================================== 3 configuration
 h1("3. Configuration")
@@ -409,6 +454,17 @@ table([["Key", "Default", "Meaning"],
        ["value_cache_max_distinct", "2000", "Above this, a column is high-cardinality and searched live."],
        ["value_scan_max_rows", "5e7", "Larger tables are sampled or time-windowed when enumerating values."]],
       [45, 45, 80])
+
+h2("3.5 llm (clicksense-chat)")
+table([["Key", "Default", "Meaning"],
+       ["base_url", "$OPENAI_BASE_URL or OpenAI", "OpenAI-compatible endpoint."],
+       ["api_key", "env", "Prefer OPENAI_API_KEY / CLICKSENSE_LLM_API_KEY in the environment or .env."],
+       ["model", "gpt-4.1-mini", "Any model with tool calling."],
+       ["temperature", "provider default", "Some reasoning models reject it; leave unset for those."],
+       ["auto_context", "true", "Call get_context before the model's first turn."],
+       ["max_steps / max_tool_chars", "16 / 12000", "Tool rounds per question / tool result size sent to the model."],
+       ["timeout_s, extra_headers", "120 / {}", "HTTP timeout; extra headers (e.g. for gateways)."],
+       ["mcp_url", "none (in-process)", "Talk to a running ClickSense HTTP server instead."]], [45, 40, 85])
 
 # ============================================================================== 4 workflow
 h1("4. The recommended agent workflow")
@@ -967,6 +1023,8 @@ table([["File", "Covers"],
        ["tests/test_semantic.py", "Loader, search, glossary, resolver statuses, metric compiler, periods — offline."],
        ["tests/test_mcp.py", "readOnlyHint on every tool, isError on refusals, resources, prompts, native skills, "
         "elicitation with and without client support."],
+       ["tests/test_agent.py", "The OpenAI-compatible bridge with a scripted fake LLM: tool mapping, auto-context, "
+        "refusals and bad arguments, clarification, step limit."],
        ["tests/test_live.py", "Against the demo database: limits, account boundary, pre-flight, breaker, slots, "
         "cancellation, cache, end-to-end tools, audit content. Skipped when ClickHouse is down."]], [42, 128])
 h2("12.2 Known limits")

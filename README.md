@@ -44,9 +44,10 @@ cp clicksense.example.yaml clicksense.yaml
 ```
 
 `--check` prints the server state (connection, `readonly` level, limits, semantic-layer
-content). The 100 tests cover the guard (55 attacks), the offline semantic layer, the MCP
+content). The 106 tests cover the guard (55 attacks), the offline semantic layer, the MCP
 protocol and — when the local database is running — real integration (circuit breaker,
 cancellation, pre-flight estimate, ClickHouse limits).
+A scripted fake LLM covers the OpenAI-compatible bridge without any API key.
 
 ### Connect it to Claude Code / Claude Desktop
 
@@ -64,6 +65,45 @@ cancellation, pre-flight estimate, ClickHouse limits).
 Over HTTP (streamable, MCP protocol 2026-07-28): `clicksense --transport http --port 3110`
 → `http://127.0.0.1:3110/mcp`. No built-in authentication: keep it on localhost or behind an
 authenticating proxy.
+
+### Use it with an OpenAI-compatible LLM (your own API key)
+
+The model does not need to speak MCP: `clicksense-chat` is the MCP client in between. It hands
+the ClickSense tools to any OpenAI-compatible chat API (OpenAI, Azure OpenAI, Mistral, Groq,
+DeepSeek, OpenRouter, vLLM, Ollama, LM Studio…) as function tools, runs the calls, and loops
+until the model answers.
+
+```bash
+uv pip install --python .venv/bin/python -e ".[llm]"
+cp .env.example .env        # then put your key in it: OPENAI_API_KEY=sk-...
+```
+
+```bash
+.venv/bin/clicksense-chat                                      # interactive
+```
+
+```bash
+.venv/bin/clicksense-chat -q "Revenue by channel in France last month"
+```
+
+```bash
+.venv/bin/clicksense-chat --base-url https://api.mistral.ai/v1 --model mistral-large-latest
+```
+
+Before each question the bridge calls `get_context` itself (`llm.auto_context`), so ambiguities
+reach the model even if it would have skipped that step; when the model calls
+`ask_user_to_clarify`, the question is asked in the terminal. In code:
+
+```python
+from clicksense.agent import Agent, connect
+from clicksense.config import load_settings
+
+settings = load_settings("clicksense.yaml")
+async with connect(settings) as client:
+    agent = Agent(settings.llm, client)
+    await agent.start()
+    print(await agent.ask("What was revenue in France last month?"))
+```
 
 ## What the agent sees
 
@@ -204,4 +244,6 @@ src/clicksense/
   lint.py       advisor (columns, values, performance)
   metrics.py    metric and period compilation
   audit.py      JSONL audit log (without parameter values)
+  agent.py      OpenAI-compatible bridge (MCP client + tool-calling loop)
+  chat.py       clicksense-chat command line
 ```

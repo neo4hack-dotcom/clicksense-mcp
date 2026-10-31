@@ -83,10 +83,30 @@ class Policy(BaseModel):
     server_parse_fallback: bool = True
 
 
+class LLM(BaseModel):
+    """Any OpenAI-compatible chat-completions endpoint, for `clicksense-chat` (OpenAI, Azure OpenAI,
+    Mistral, Groq, DeepSeek, OpenRouter, vLLM, Ollama, LM Studio...). The key is read from
+    `api_key`, else $CLICKSENSE_LLM_API_KEY, else $OPENAI_API_KEY: keep it out of the YAML file."""
+
+    base_url: str | None = None  # None: $OPENAI_BASE_URL, else https://api.openai.com/v1
+    api_key: str | None = None
+    model: str = "gpt-4.1-mini"
+    temperature: float | None = None  # None: provider default (some reasoning models reject it)
+    max_steps: int = 16  # tool-call rounds per question
+    # Call get_context before the model's first turn, so ambiguities and the right tables are in
+    # front of it whatever its tool-use habits. Weaker models skip "call X first" instructions.
+    auto_context: bool = True
+    max_tool_chars: int = 12_000  # a tool result larger than this is truncated before the model sees it
+    timeout_s: float = 120
+    extra_headers: dict[str, str] = Field(default_factory=dict)
+    mcp_url: str | None = None  # None: run ClickSense in-process; else e.g. http://127.0.0.1:3110/mcp
+
+
 class Settings(BaseModel):
     connection: Connection = Field(default_factory=Connection)
     limits: Limits = Field(default_factory=Limits)
     policy: Policy = Field(default_factory=Policy)
+    llm: LLM = Field(default_factory=LLM)
     semantic_dir: Path = Path("semantic")
     audit_path: Path | None = Path("audit/clicksense.jsonl")
     catalog_ttl_s: float = 600

@@ -17,9 +17,11 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-asyncio>=0.24"]
 docs = ["reportlab>=4.2"]
+llm = ["openai>=1.40"]
 
 [project.scripts]
 clicksense = "clicksense.server:main"
+clicksense-chat = "clicksense.chat:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -38,3 +38,12 @@ semantic_dir: semantic
 audit_path: audit/clicksense.jsonl
 catalog_ttl_s: 600
 value_cache_ttl_s: 3600
+
+# For clicksense-chat: any OpenAI-compatible LLM. Put the key in the environment or in .env
+# (OPENAI_API_KEY), not here.
+llm:
+  base_url: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+  model: ${CLICKSENSE_LLM_MODEL:-gpt-4.1-mini}
+  auto_context: true          # call get_context before the model's first turn
+  max_steps: 16
+  # mcp_url: http://127.0.0.1:3110/mcp   # use a running HTTP server instead of in-process
