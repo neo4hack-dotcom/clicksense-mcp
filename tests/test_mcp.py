@@ -22,9 +22,9 @@ async def test_every_tool_declares_its_hints(app):
     assert len(tools) >= 20
     for t in tools:
         ann = t.annotations
-        assert ann is not None and ann.readOnlyHint is not None, t.name
-        assert ann.readOnlyHint is (t.name not in WRITES), t.name
-        assert ann.openWorldHint is False, t.name
+        assert ann is not None and ann.read_only_hint is not None, t.name
+        assert ann.read_only_hint is (t.name not in WRITES), t.name
+        assert ann.open_world_hint is False, t.name
         assert t.description and len(t.description) > 30, t.name
 
 

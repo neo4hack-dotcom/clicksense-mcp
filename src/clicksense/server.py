@@ -388,6 +388,7 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(2)
     service = ClickSense(settings)
     if args.check:
+        service.catalog.refresh()  # the catalog is lazy; load it so the report shows real table counts
         print(json.dumps(service.status(), indent=2, default=str))
         return
     app = build_app(settings, service)
