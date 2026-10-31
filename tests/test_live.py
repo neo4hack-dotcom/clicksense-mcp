@@ -15,6 +15,10 @@ from .conftest import CH_UP, make_settings
 
 pytestmark = pytest.mark.integration
 
+# Slow on CPU but reads only 200k rows: a query that *reads* billions of rows to be slow would
+# eat the account's hourly read_rows quota and make every later test fail with quota_exceeded.
+SLOW = "SELECT count() FROM numbers(100000) AS a, numbers(100000) AS b WHERE a.number != b.number"
+
 
 def test_run_query_basic(live):
     r = live.run_query("SELECT country, count() AS n FROM shop.orders WHERE order_date >= {d:Date} "
@@ -95,7 +99,7 @@ def test_circuit_breaker_opens_on_timeouts(tmp_path):
     if not CH_UP:
         pytest.skip("no ClickHouse")
     ex = Executor(make_settings(tmp_path, breaker_failures=2, breaker_cooldown_s=2))
-    slow = "SELECT count() FROM numbers(100000000000) WHERE sleepEachRow(0) = 0"
+    slow = SLOW
     for _ in range(2):
         with pytest.raises(ClickSenseError) as ei:
             ex.run(slow, tool="t", use_cache=False, settings={"max_execution_time": 1, "max_rows_to_read": 0})
@@ -119,8 +123,7 @@ def test_concurrency_slots(tmp_path):
     if not CH_UP:
         pytest.skip("no ClickHouse")
     ex = Executor(make_settings(tmp_path, max_concurrent=1, queue_timeout_s=0.2))
-    t = threading.Thread(target=lambda: _swallow(ex.run, "SELECT count() FROM numbers(100000000000) WHERE "
-                                                 "sleepEachRow(0) = 0", tool="t", use_cache=False,
+    t = threading.Thread(target=lambda: _swallow(ex.run, SLOW, tool="t", use_cache=False,
                                                  settings={"max_execution_time": 2, "max_rows_to_read": 0}))
     t.start()
     time.sleep(0.5)
@@ -136,7 +139,7 @@ def test_cancel_only_own_queries(live):
     assert ei.value.code == "not_ours"
     done = {}
     t = threading.Thread(target=lambda: done.setdefault("e", _swallow(
-        live.executor.run, "SELECT count() FROM numbers(100000000000) WHERE sleepEachRow(0) = 0", tool="t",
+        live.executor.run, SLOW, tool="t",
         use_cache=False, settings={"max_execution_time": 20, "max_rows_to_read": 0})))
     t.start()
     time.sleep(0.7)
