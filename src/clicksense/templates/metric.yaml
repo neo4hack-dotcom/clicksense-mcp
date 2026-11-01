@@ -1,0 +1,18 @@
+  # --- New metric. Fill every TODO, then run: clicksense-admin kb validate --live ---
+  - name: {{name}}                 # snake_case id used by query_metric(metrics=["{{name}}"])
+    label: TODO Human name          # shown in answers
+    description: TODO One sentence a business user would sign off on (what is counted, what is not).
+    table: TODO_db.TODO_table       # the table the metric is computed on (must be in the dictionary)
+    # An aggregate over that table, using its alias from the dictionary (orders -> o):
+    #   sum(o.amount_eur)   count()   uniqExact(o.customer_id)   round(sum(x) / count(), 2)
+    expression: TODO
+    # Conditions ALWAYS applied (official definition). Remove the key if there are none.
+    filters: []
+    time_column: TODO_date_column    # column used for periods ("last_month") and grains
+    unit: ""                         # EUR, %, units... (optional)
+    # Words users say for this metric. One word must point to ONE metric: for an ambiguous word,
+    # use a glossary term with several senses instead.
+    synonyms: []
+    # Dimensions this metric may be grouped/filtered by: columns of the table or `dimensions:`
+    # declared in the dictionary (joins are added automatically).
+    dimensions: []

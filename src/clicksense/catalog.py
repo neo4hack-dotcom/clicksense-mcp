@@ -4,6 +4,13 @@ ClickHouse is the source of truth for what exists (tables, columns, types, keys,
 the dictionary adds what only people know (meaning, units, PII, value labels, joins).
 A table described in the dictionary but missing from ClickHouse is reported, not invented.
 When ClickHouse is unreachable the catalog serves the dictionary alone and says so.
+
+Precedence for what the agent reads: a dictionary `description` wins over the ClickHouse
+COMMENT (people refine meanings; COMMENTs are often terse or stale), the dictionary
+`time_column` wins over the one inferred from the keys.
+
+Freshness: the live schema is cached `catalog_ttl_s` seconds (refresh_catalog forces a reload);
+dictionary edits are picked up without any database call (`sync_specs`).
 """
 from __future__ import annotations
 
@@ -19,6 +26,8 @@ from .knowledge import Knowledge
 
 @dataclass
 class Column:
+    """One column: what ClickHouse says (name, type, comment, key flags) + its dictionary `spec`."""
+
     name: str
     type: str
     comment: str = ""
@@ -30,10 +39,12 @@ class Column:
 
     @property
     def description(self) -> str:
+        """Dictionary description, else the ClickHouse COMMENT."""
         return self.spec.get("description") or self.comment
 
     @property
     def pii(self) -> bool:
+        """Marked `pii: true` in the dictionary (the guard then refuses to return it raw)."""
         return bool(self.spec.get("pii"))
 
     @property
@@ -47,9 +58,12 @@ class Column:
 
     @property
     def is_text(self) -> bool:
+        """Text-like columns: the ones whose values the resolver matches against user words."""
         return self.base_type in ("String",) or self.base_type.startswith(("FixedString", "Enum"))
 
     def to_dict(self, brief: bool = False) -> dict[str, Any]:
+        """The column as tools show it. brief=True (get_context) keeps name, type, meaning, keys
+        and PII; the full form (describe_table) adds units, synonyms, values and caveats."""
         out: dict[str, Any] = {"name": self.name, "type": self.type}
         if self.description:
             out["description"] = self.description
@@ -71,6 +85,9 @@ class Column:
 
 @dataclass
 class Table:
+    """One table: ClickHouse metadata (engine, sizes, keys, comment, columns, skip indices) +
+    its dictionary `spec`. live=False when it comes from the dictionary only (ClickHouse down)."""
+
     database: str
     name: str
     engine: str = ""
@@ -88,14 +105,18 @@ class Table:
 
     @property
     def fqn(self) -> str:
+        """database.table"""
         return f"{self.database}.{self.name}"
 
     @property
     def description(self) -> str:
+        """Dictionary description, else the ClickHouse COMMENT."""
         return self.spec.get("description") or self.comment
 
     @property
     def time_column(self) -> str | None:
+        """The column periods are filtered on: dictionary `time_column`, else the Date/DateTime
+        partition column, else a Date/DateTime first ORDER BY column. None if there is none."""
         if self.spec.get("time_column"):
             return self.spec["time_column"]
         for c in self.columns.values():
@@ -109,9 +130,11 @@ class Table:
 
     @property
     def is_merge_tree(self) -> bool:
+        """MergeTree family: the only engines EXPLAIN ESTIMATE and partition pruning apply to."""
         return "MergeTree" in self.engine
 
     def summary(self) -> dict[str, Any]:
+        """One line per table, for list_tables."""
         out: dict[str, Any] = {"table": self.fqn}
         if self.description:
             out["description"] = self.description
@@ -124,6 +147,7 @@ class Table:
         return out
 
     def to_dict(self) -> dict[str, Any]:
+        """Everything describe_table returns, including generated performance hints."""
         out = self.summary()
         out.update({
             "engine": self.engine,
@@ -156,6 +180,8 @@ _SYS = "('system', 'INFORMATION_SCHEMA', 'information_schema')"
 
 
 class Catalog:
+    """All tables the agent may see: those of the allowed databases, minus denied tables."""
+
     def __init__(self, executor: Executor, knowledge: Knowledge, *, ttl_s: float, allowed: list[str],
                  denied: list[str]):
         self.executor = executor
@@ -170,11 +196,15 @@ class Catalog:
 
     # ------------------------------------------------------------------ loading
     def _filter(self) -> tuple[str, dict[str, Any]]:
+        """WHERE clause selecting the databases to introspect (allow-list, else non-system)."""
         if self.allowed:
             return "database IN {dbs:Array(String)}", {"dbs": self.allowed}
         return f"database NOT IN {_SYS}", {}
 
     def refresh(self, force: bool = False) -> None:
+        """Reload the live schema if older than the TTL (or always with force=True). On failure the
+        previous schema is kept, or the dictionary is used if there is none, and `error` is set
+        (server_status and list_tables report it)."""
         if not force and self.tables and time.monotonic() - self.loaded_at < self.ttl:
             return
         with self._lock:
@@ -190,11 +220,14 @@ class Catalog:
             self.loaded_at = time.monotonic()
 
     def _q(self, sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+        """A metadata query as a list of dicts; no row cap (a warehouse may have many columns)."""
         out = self.executor.run(sql, params, tool="catalog", use_cache=False, admit=False,
                                 settings={"max_result_rows": 0, "result_overflow_mode": "throw"})
         return [dict(zip(out.columns, r)) for r in out.rows]
 
     def _load_live(self) -> dict[str, Table]:
+        """Three metadata queries: system.tables, system.columns, system.data_skipping_indices.
+        These system tables are read here, by the server, never by agent SQL (the guard refuses)."""
         where, params = self._filter()
         tables: dict[str, Table] = {}
         for r in self._q(
@@ -228,6 +261,7 @@ class Catalog:
         return tables
 
     def _load_dictionary_only(self) -> dict[str, Table]:
+        """Degraded mode: tables as documented, flagged live=False, types from the dictionary."""
         out = {}
         for fqn, spec in self.knowledge.tables.items():
             db, _, name = fqn.partition(".")
@@ -246,12 +280,15 @@ class Catalog:
 
     # ------------------------------------------------------------------ lookups
     def all(self) -> list[Table]:
+        """Every table, with the latest schema and the latest dictionary edits applied."""
         self.refresh()
         self.knowledge.maybe_reload()
         self.sync_specs()
         return list(self.tables.values())
 
     def resolve(self, name: str, default_db: str) -> Table:
+        """Find a table by name: "db.table", "table" in the default database, case-insensitive,
+        then a unique table of that name in any database. Unknown -> error with close matches."""
         self.refresh()
         name = name.strip().strip("`\"")
         fqn = name if "." in name else f"{default_db}.{name}"
@@ -272,6 +309,8 @@ class Catalog:
                               candidates=[c[0] for c in close] or [m.fqn for m in matches])
 
     def column(self, table: Table, name: str) -> Column:
+        """Find a column (exact, then case-insensitive). Unknown -> error listing columns whose
+        dictionary synonyms contain the name, then fuzzy matches."""
         if name in table.columns:
             return table.columns[name]
         for c in table.columns.values():
@@ -288,6 +327,7 @@ class Catalog:
                               candidates=cands)
 
     def pii_columns(self, db: str, table: str) -> set[str]:
+        """Names of the PII columns of a table (used by the guard)."""
         t = self.tables.get(f"{db}.{table}")
         if not t:
             spec = self.knowledge.table_spec(db, table)

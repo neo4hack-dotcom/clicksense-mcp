@@ -30,7 +30,16 @@ _WORD = re.compile(r"[\w'’-]+", re.UNICODE)
 
 
 class ClickSense:
+    """Everything the tools do, wired together once per server process.
+
+    Attributes: settings, knowledge (semantic layer), executor (ClickHouse gateway), catalog (live schema +
+    dictionary), resolver (user words -> stored values), guard (SQL acceptance), advisor (findings), metrics
+    (metric compiler), audit (JSONL log). Each public method backs one MCP tool of the same name (see
+    server.py) and returns a JSON-able dict with "ok": true, or raises ClickSenseError.
+    """
+
     def __init__(self, settings: Settings, executor: Executor | None = None):
+        """Build all components. Nothing connects to ClickHouse here: the first tool call does."""
         self.settings = settings
         self.limits = settings.limits
         self.default_db = settings.connection.database
@@ -50,14 +59,19 @@ class ClickSense:
         self._cat_index: tuple[float, BM25] | None = None
 
     def _pii(self, db: str, table: str) -> set[str]:
+        """PII columns of a table, for the guard (refreshes the catalog first so the dictionary is current)."""
         self.catalog.refresh()
         return self.catalog.pii_columns(db, table)
 
     def _cap(self, max_rows: int | None) -> int:
+        """Rows to return: the caller's max_rows, else limits.default_rows, never above limits.hard_max_rows."""
         return max(1, min(max_rows or self.limits.default_rows, self.limits.hard_max_rows))
 
     # ================================================================== discovery
     def list_tables(self, search: str | None = None) -> dict[str, Any]:
+        """Tool list_tables: every visible table (optionally filtered by search words). Warns when ClickHouse is
+        unreachable, and lists tables documented in the dictionary but absent from ClickHouse.
+        """
         tables = self.catalog.all()
         if search:
             hits = {d.id for _, d in self._catalog_index().search(search, limit=50)}
@@ -72,6 +86,9 @@ class ClickSense:
         return out
 
     def describe_table(self, table: str, include_samples: bool = False) -> dict[str, Any]:
+        """Tool describe_table: the full table description (Table.to_dict) plus the knowledge documents that
+        apply to it, the metrics computed on it and, optionally, a 5-row sample.
+        """
         self.catalog.all()
         t = self.catalog.resolve(table, self.default_db)
         out = {"ok": True, **t.to_dict()}
@@ -86,6 +103,9 @@ class ClickSense:
         return out
 
     def _catalog_index(self) -> BM25:
+        """A BM25 index over the live catalog (table names, descriptions, column names and descriptions), rebuilt
+        when the catalog reloads. Finds tables that the dictionary does not document yet.
+        """
         self.catalog.refresh()
         if self._cat_index and self._cat_index[0] == self.catalog.loaded_at:
             return self._cat_index[1]
@@ -121,10 +141,13 @@ class ClickSense:
         mhits = by_kind.get("metric", [])
         best = mhits[0][0] if mhits else 0
         searched = [d.payload["name"] for sc, d in mhits if sc >= best * 0.5]
-        names = list(dict.fromkeys(glossary_metrics + searched))
+        # A metric named word-for-word in the question beats the senses of an ambiguous term
+        # ("net sales" -> net_revenue, even though "sales" alone could mean three metrics).
+        named = self.knowledge.find_metrics(question)
+        names = list(dict.fromkeys(named + glossary_metrics + searched))
         metrics = [self.knowledge.metrics[n] for n in names if n in self.knowledge.metrics][: max(2, min(limit, 4))]
         for rank, m in enumerate(metrics):
-            boost = 15 if m["name"] in glossary_metrics else (10 if rank == 0 else 3)
+            boost = 15 if m["name"] in named or m["name"] in glossary_metrics else (10 if rank == 0 else 3)
             table_scores[m["table"]] = table_scores.get(m["table"], 0) + boost
         # Values named in the question pull their tables up ("on the web" -> orders.channel).
         prelim = [t for t, _ in sorted(table_scores.items(), key=lambda kv: -kv[1]) if t in self.catalog.tables][:6]
@@ -221,6 +244,9 @@ class ClickSense:
         return [{"term": k, "matches": v} for k, v in found.items()]
 
     def search_knowledge(self, query: str, kinds: list[str] | None = None, limit: int = 8) -> dict[str, Any]:
+        """Tool search_knowledge: BM25 search over the semantic layer, each hit with the fields useful for its
+        kind (excerpt for documents, SQL for examples, senses for terms...).
+        """
         hits = self.knowledge.search(query, set(kinds) if kinds else None, limit)
         items = []
         for score, d in hits:
@@ -242,6 +268,7 @@ class ClickSense:
         return {"ok": True, "results": items}
 
     def get_knowledge(self, doc_id: str) -> dict[str, Any]:
+        """Tool get_knowledge: one knowledge document in full."""
         self.knowledge.maybe_reload()
         d = self.knowledge.docs.get(doc_id)
         if not d:
@@ -251,11 +278,13 @@ class ClickSense:
 
     # ================================================================== skills & metrics
     def list_skills(self) -> dict[str, Any]:
+        """Tool list_skills."""
         self.knowledge.maybe_reload()
         return {"ok": True, "skills": [{"name": s["name"], "description": s["description"],
                                         "when_to_use": s["when_to_use"]} for s in self.knowledge.skills.values()]}
 
     def get_skill(self, name: str) -> dict[str, Any]:
+        """Tool get_skill: one playbook; an unknown name gets the closest existing one as a hint."""
         self.knowledge.maybe_reload()
         s = self.knowledge.skills.get(name)
         if not s:
@@ -265,6 +294,7 @@ class ClickSense:
         return {"ok": True, **s}
 
     def list_metrics(self) -> dict[str, Any]:
+        """Tool list_metrics: the public fields of every governed metric."""
         self.knowledge.maybe_reload()
         return {"ok": True, "metrics": [{k: m[k] for k in ("name", "label", "description", "table", "unit",
                                                            "dimensions", "synonyms") if k in m}
@@ -274,6 +304,10 @@ class ClickSense:
                      filters: dict[str, Any] | None = None, period: Any = None, grain: str | None = None,
                      order_by: str | None = None, descending: bool = True, limit: int = 100,
                      fmt: str = "json") -> dict[str, Any]:
+        """Tool query_metric: compile the metrics (metrics.py) and run the SQL through run_query, so the guard,
+        pre-flight, limits, cache and audit all apply. Adds the definitions, the resolved period, the value
+        resolutions, the SQL and its parameters to the result.
+        """
         compiled = self.metrics.compile(metrics, dimensions=dimensions, filters=filters, period=period, grain=grain,
                                         order_by=order_by, descending=descending,
                                         limit=min(limit, self.limits.hard_max_rows))
@@ -289,6 +323,7 @@ class ClickSense:
 
     # ================================================================== querying
     def _guarded(self, sql: str, max_rows: int | None) -> GuardResult:
+        """Guard a statement with the row cap (the catalog is refreshed first so PII and tables are current)."""
         self.catalog.refresh()
         return self.guard.check(sql, self._cap(max_rows))
 
@@ -315,6 +350,11 @@ class ClickSense:
 
     def run_query(self, sql: str, params: dict[str, Any] | None = None, max_rows: int | None = None,
                   fmt: str = "json", tool: str = "run_query") -> dict[str, Any]:
+        """Tool run_query: guard -> pre-flight -> execute -> render -> review.
+        After running, the advisor's errors/warnings are attached as `notes`; when the result is empty the
+        value check goes live, because a literal that does not exist is the usual reason for zero rows.
+        ClickHouse errors about names/types get the advisor's findings attached. Every outcome is audited.
+        """
         t0 = time.perf_counter()
         try:
             g = self._guarded(sql, max_rows)
@@ -340,12 +380,14 @@ class ClickSense:
         return result
 
     def _safe_review(self, g: GuardResult, live: bool) -> list[dict[str, Any]]:
+        """Advisor findings, never failing the query that already ran."""
         try:
             return self.advisor.review(g, check_values=True, live_values=live)
         except ClickSenseError:
             return []
 
     def _attach_findings(self, exc: ClickSenseError, sql: str, max_rows: int | None) -> None:
+        """On a ClickHouse error, add the advisor's error findings (did-you-mean...) to the exception."""
         try:
             g = self._guarded(sql, max_rows)
             f = [x for x in self.advisor.review(g, check_values=True) if x["severity"] == "error"]
@@ -355,6 +397,10 @@ class ClickSense:
             pass
 
     def _render(self, out: QueryOutcome, fmt: str, g: GuardResult) -> dict[str, Any]:
+        """Shape a result for the caller: json rows, markdown table or csv, within limits.max_response_bytes
+        (rows beyond the budget are dropped and the result says truncated: response_bytes). A truncated result
+        always carries a hint that it is not the full answer.
+        """
         rows, truncated, reason = out.rows, out.truncated, out.truncated_reason
         budget = self.limits.max_response_bytes
         size = len(json.dumps(out.columns))
@@ -388,6 +434,10 @@ class ClickSense:
 
     def validate_query(self, sql: str, params: dict[str, Any] | None = None, check_values: bool = True,
                        max_rows: int | None = None) -> dict[str, Any]:
+        """Tool validate_query: everything we can say without running the query: guard verdict, advisor findings
+        (with live value checks), and the index-based estimate. verdict is ok | review_warnings |
+        fix_before_running | rejected.
+        """
         try:
             g = self._guarded(sql, max_rows)
         except Rejected as exc:
@@ -413,6 +463,9 @@ class ClickSense:
                 "sql_to_run": g.sql, "parser": g.parser}
 
     def explain_query(self, sql: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Tool explain_query: EXPLAIN indexes = 1 (partitions and granules each index skips), EXPLAIN ESTIMATE
+        and the advisor's findings. Runs on the caller's SQL, not on the LIMIT-wrapped one.
+        """
         g = self._guarded(sql, None)
         plan = self.executor.explain(g.original, params, kind="indexes = 1")
         estimate = self.executor.estimate(g.original, params)
@@ -423,6 +476,9 @@ class ClickSense:
 
     def sample_rows(self, table: str, n: int = 10, columns: list[str] | None = None,
                     where: str | None = None) -> dict[str, Any]:
+        """Tool sample_rows: a few rows of a table, PII columns removed (and listed in hidden_pii_columns). The
+        optional `where` text is guarded with the rest of the statement.
+        """
         t = self.catalog.resolve(table, self.default_db)
         cols = [self.catalog.column(t, c) for c in columns] if columns else list(t.columns.values())
         if self.settings.policy.pii == "block":
@@ -441,6 +497,9 @@ class ClickSense:
 
     # ================================================================== control & disambiguation
     def resolve_values(self, table: str, column: str, terms: list[str]) -> dict[str, Any]:
+        """Tool resolve_values: user words -> stored values of one column (resolver.py). Refused on PII columns:
+        their values are never enumerated.
+        """
         t = self.catalog.resolve(table, self.default_db)
         c = self.catalog.column(t, column)
         if c.pii and self.settings.policy.pii == "block":
@@ -452,6 +511,9 @@ class ClickSense:
                                                 "with the candidates rather than picking one."})}
 
     def locate_value(self, term: str, tables: list[str] | None = None, limit: int = 10) -> dict[str, Any]:
+        """Tool locate_value: which low-cardinality text columns contain a value (at most 60 columns scanned,
+        each through the cached value sets). Flags a value found in several columns as ambiguous.
+        """
         targets = [self.catalog.resolve(x, self.default_db) for x in tables] if tables else self.catalog.all()
         matches = []
         scanned = 0
@@ -483,6 +545,9 @@ class ClickSense:
         return out
 
     def find_columns(self, term: str, limit: int = 10) -> dict[str, Any]:
+        """Tool find_columns: columns a business word may designate, from the dictionary (search on descriptions
+        and synonyms) and fuzzy matching on column names; flags near-ties.
+        """
         self.catalog.all()
         scored: dict[tuple[str, str], float] = {}
         for s, d in self.knowledge.search(term, {"column"}, limit=20):
@@ -511,6 +576,10 @@ class ClickSense:
         return out
 
     def profile_column(self, table: str, column: str) -> dict[str, Any]:
+        """Tool profile_column: one bounded aggregate query (count, nulls, approximate distinct, min/max,
+        quantiles, top values). Tables above value_scan_max_rows are sampled or limited to 90 days; `scope`
+        says which. Top values are omitted for PII columns.
+        """
         t = self.catalog.resolve(table, self.default_db)
         c = self.catalog.column(t, column)
         src, scope = f"{_q(t.database)}.{_q(t.name)}", "full"
@@ -539,6 +608,9 @@ class ClickSense:
                 **({"description": c.description} if c.description else {}), "query": out.stats()}
 
     def check_freshness(self, table: str) -> dict[str, Any]:
+        """Tool check_freshness: max(time column) and the lag in hours, plus the refresh cadence documented in
+        the dictionary.
+        """
         t = self.catalog.resolve(table, self.default_db)
         tc = t.time_column
         out: dict[str, Any] = {"ok": True, "table": t.fqn, "rows": t.total_rows, "time_column": tc}
@@ -557,6 +629,9 @@ class ClickSense:
 
     # ================================================================== ops
     def status(self) -> dict[str, Any]:
+        """Tool server_status: reachability, readonly level, protection state, running queries, caches, totals,
+        catalog and knowledge counts, and a warning when the account has readonly = 1.
+        """
         reachable = self.executor.ping()
         ex = self.executor
         out = {
@@ -588,6 +663,7 @@ class ClickSense:
         return out
 
     def refresh(self) -> dict[str, Any]:
+        """Tool refresh_catalog: reload semantic files and the live schema, clear the value and result caches."""
         self.knowledge.reload()
         self.catalog.refresh(force=True)
         self.resolver.cache.clear()
@@ -596,6 +672,9 @@ class ClickSense:
                 "knowledge_errors": self.knowledge.errors}
 
     def suggest_knowledge(self, kind: str, title: str, content: str, sql: str | None = None) -> dict[str, Any]:
+        """Tool suggest_knowledge: write a proposal to semantic/inbox/ as Markdown with front-matter (kind,
+        title, status: proposed). Never loaded by the server: a person reviews it (clicksense-admin kb inbox).
+        """
         inbox: Path = self.settings.semantic_dir / "inbox"
         inbox.mkdir(parents=True, exist_ok=True)
         slug = re.sub(r"[^a-z0-9]+", "-", fold(title))[:60].strip("-") or "note"
@@ -610,6 +689,7 @@ class ClickSense:
 
 
 def _excerpt(body: str, query: str, size: int = 600) -> str:
+    """The paragraph of a document that shares most words with the query, cut to `size` characters."""
     if len(body) <= size:
         return body
     q = set(tokens(query))
@@ -619,7 +699,9 @@ def _excerpt(body: str, query: str, size: int = 600) -> str:
 
 
 def _markdown(cols: list[str], rows: list[list[Any]]) -> str:
+    """Rows as a Markdown table (pipes escaped, newlines flattened)."""
     def cell(v: Any) -> str:
+        """One Markdown cell."""
         return "" if v is None else str(v).replace("|", "\\|").replace("\n", " ")
     lines = ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
     lines += ["| " + " | ".join(cell(v) for v in r) + " |" for r in rows]
@@ -627,6 +709,7 @@ def _markdown(cols: list[str], rows: list[list[Any]]) -> str:
 
 
 def _next_steps(has_metric: bool, ambiguous: bool) -> list[str]:
+    """Workflow reminders returned by get_context, adapted to what it found."""
     steps = []
     if ambiguous:
         steps.append("Resolve the ambiguities first (ask_user_to_clarify), do not pick a meaning silently.")

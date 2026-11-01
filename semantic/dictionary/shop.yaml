@@ -37,7 +37,7 @@ tables:
     columns:
       order_id: {description: Order line identifier}
       order_date: {description: Order date (partition key), synonyms: [date, day]}
-      order_ts: {description: Order timestamp, Paris time}
+      order_ts: {description: "Order timestamp, Paris time"}
       customer_id: {description: Customer (FK shop.customers)}
       product_id: {description: Product (FK shop.products)}
       quantity: {description: Units ordered, unit: units, synonyms: [quantity, qty, volume, units]}

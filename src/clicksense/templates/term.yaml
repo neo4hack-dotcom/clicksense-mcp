@@ -1,0 +1,13 @@
+  # --- New glossary term. Two shapes: ---
+  #  * unambiguous: keep `maps_to` and delete `senses`;
+  #  * ambiguous (one word, several meanings): delete `maps_to`, list the meanings under `senses`.
+  #    get_context then reports it and the agent asks the user which one is meant.
+  - term: {{name}}
+    synonyms: []                     # other words or abbreviations for the same thing
+    definition: TODO One sentence.
+    maps_to: "TODO metric:<name> | db.table.column | db.table"
+    # senses:
+    #   - meaning: TODO first meaning
+    #     maps_to: "metric:<name>"
+    #   - meaning: TODO second meaning
+    #     maps_to: "db.table.column = 'VALUE'"

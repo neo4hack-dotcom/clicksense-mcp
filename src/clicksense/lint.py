@@ -10,6 +10,16 @@ Three families, each finding has a `severity` (error | warning | info) and a fix
 
 Value checks use only cached/dictionary value lists unless `check_values` asks for a live
 lookup, so linting stays cheap.
+
+Where findings show up: validate_query (all of them), run_query (errors and warnings, as
+`notes`; value checks go live when the result is empty, the usual symptom of a wrong literal),
+the pre-flight refusal (performance ones), and errors returned by ClickHouse (as `findings`).
+
+HOW TO ADD A FINDING
+  Add a check in `_columns`, `_performance` or `_values` returning
+  `_f(severity, "stable_code", "what is wrong, with names and numbers", "how to fix it")`.
+  severity: error = the query is wrong or will fail; warning = it will run but is risky or
+  slow; info = advice. Add a case to tests/test_live.py::test_validate_and_explain.
 """
 from __future__ import annotations
 
@@ -22,10 +32,13 @@ from .errors import ClickSenseError
 from .guard import GuardResult
 from .resolver import Resolver
 
+# Performance findings (no partition filter, primary key unused) only fire on tables at least this
+# big: on a small table a full scan costs nothing and the advice would be noise.
 BIG_TABLE_ROWS = 10_000_000
 
 
 def _f(severity: str, code: str, message: str, fix: str | None = None, **extra: Any) -> dict[str, Any]:
+    """A finding as returned to the agent: {severity, code, message, fix?, ...extra}."""
     out = {"severity": severity, "code": code, "message": message}
     if fix:
         out["fix"] = fix
@@ -34,11 +47,17 @@ def _f(severity: str, code: str, message: str, fix: str | None = None, **extra: 
 
 
 class Advisor:
+    """Static review of a guarded query, using the catalog (columns, keys, sizes, caveats) and the
+    resolver (stored values). Never runs the query itself."""
+
     def __init__(self, catalog: Catalog, resolver: Resolver):
         self.catalog = catalog
         self.resolver = resolver
 
     def review(self, g: GuardResult, *, check_values: bool = True, live_values: bool = False) -> list[dict[str, Any]]:
+        """All findings for a query. check_values: compare filter literals with stored values;
+        live_values: allowed to query ClickHouse for those values (else cached lists only).
+        When ClickHouse parsed the query (no sqlglot tree) only table-level findings are possible."""
         findings: list[dict[str, Any]] = [_f("info", "parser", w) for w in g.warnings]
         tables: dict[str, Table] = {}
         for db, name in g.tables:
@@ -66,6 +85,7 @@ class Advisor:
     # ------------------------------------------------------------------ helpers
     @staticmethod
     def _aliases(tree: exp.Expression, tables: dict[str, Table]) -> dict[str, Table]:
+        """{alias or table name (lower-case): Table}, to know which table `o.amount` refers to."""
         amap: dict[str, Table] = {}
         for t in tree.find_all(exp.Table):
             tbl = tables.get(t.name.lower()) if t.name else None
@@ -77,12 +97,15 @@ class Advisor:
 
     @staticmethod
     def _owner(col: exp.Column, amap: dict[str, Table], tables: dict[str, Table]) -> Table | None:
+        """The table a column reference belongs to: by its qualifier, else the only table having it."""
         if col.table:
             return amap.get(col.table.lower())
         owners = [t for t in tables.values() if col.name in t.columns]
         return owners[0] if len(owners) == 1 else None
 
     def _columns(self, tree, tables, amap) -> list[dict[str, Any]]:
+        """Unknown columns (with suggestions; case-only mistakes called out) and unqualified
+        columns that exist in several joined tables."""
         # Only when every source is a real table: columns of subqueries/CTEs are not knowable here.
         sources = list(tree.find_all(exp.Table))
         if any(not t.name or t.name.lower() not in tables for t in sources) or tree.find(exp.Subquery):
@@ -129,6 +152,7 @@ class Advisor:
         return out
 
     def _filters(self, tree: exp.Expression) -> list[exp.Expression]:
+        """Every filtering expression: WHERE, PREWHERE and JOIN ... ON, in all SELECTs."""
         conds = []
         for sel in tree.find_all(exp.Select):
             for key in ("where", "prewhere"):
@@ -141,6 +165,9 @@ class Advisor:
         return conds
 
     def _performance(self, tree, tables, amap) -> list[dict[str, Any]]:
+        """What makes ClickHouse read too much: no filter on the partition/time column or on the
+        first ORDER BY key, SELECT *, FINAL, count(DISTINCT), leading-% LIKE, and a JOIN whose right
+        side (built in memory as a hash table) is much bigger than its left side."""
         out = []
         filtered: set[tuple[str, str]] = set()
         for cond in self._filters(tree):
@@ -199,6 +226,8 @@ class Advisor:
         return out
 
     def _values(self, tree, tables, amap, live: bool) -> list[dict[str, Any]]:
+        """Literals in `col = 'x'`, `col != 'x'`, `col IN ('x', 'y')` that are not stored values of a
+        text column, with the resolver's suggestion ('France' -> use 'FR')."""
         out = []
         checks: list[tuple[exp.Column, list[str]]] = []
         for cond in self._filters(tree):

@@ -6,6 +6,21 @@ Two protocol contracts are kept deliberately:
   file in semantic/inbox) and `cancel_query`; orchestrators cache and retry on that hint.
 * `isError` on every failure: a refusal returned as a normal payload is indistinguishable,
   at the protocol level, from data, and a caller would treat it as an answer.
+
+HOW TO ADD A TOOL (three steps)
+  1. Write the logic as a method of ClickSense in service.py: plain arguments in, a dict with
+     "ok": True out, `raise ClickSenseError(code, message, hint)` to refuse.
+  2. Declare it in build_app() below with @mcp.tool(annotations=RO or RO_LIVE or a write
+     annotation, tags={...}). Its docstring is what the model reads to decide when to call it:
+     say what it returns and when to use it. Arguments use Annotated[..., Field(description=...)].
+     Call the method through `_call(...)` so refusals become isError results.
+  3. Add it to tests/test_mcp.py (hints) and test the logic in tests/test_live.py.
+  Resources (@mcp.resource) and prompts (@mcp.prompt) follow the same pattern.
+
+HOW TO CHANGE WHAT THE MODEL IS TOLD
+  * INSTRUCTIONS below: sent to every client at connection; the workflow in a few lines.
+  * Each tool's docstring and argument descriptions.
+  * Skills (semantic/skills/*/SKILL.md): longer playbooks, editable without restart.
 """
 from __future__ import annotations
 
@@ -47,6 +62,9 @@ smaller table on the right of a JOIN; pass values as {name:Type} parameters in `
 No SETTINGS/FORMAT clauses, no system tables (use the tools), one statement per call.
 """
 
+# Tool annotations. RO: read-only and idempotent (same call, same answer: clients may cache or
+# retry it). RO_LIVE: read-only but the answer depends on live data or state (not idempotent).
+# Writes (suggest_knowledge, cancel_query) declare readOnlyHint False explicitly.
 RO = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
 RO_LIVE = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False}
 
@@ -60,6 +78,7 @@ FormatArg = Annotated[Literal["json", "markdown", "csv"], Field(
 
 
 def _clarified(action: str | None, choice: Any) -> dict:
+    """Payload of ask_user_to_clarify once the client answered (accept + choice) or declined."""
     if action == "accept" and choice is not None:
         return {"ok": True, "status": "answered", "choice": choice}
     return {"ok": True, "status": action or "declined",
@@ -67,12 +86,18 @@ def _clarified(action: str | None, choice: Any) -> dict:
 
 
 def _client_can_elicit(ctx: Context) -> bool:
+    """Whether the connected client declared the elicitation capability. Unknown -> True (try, and fall back on
+    the error).
+    """
     session = getattr(ctx.request_context, "session", None)
     caps = getattr(session, "client_capabilities", None)
     return True if caps is None else caps.elicitation is not None  # unknown: try, and fall back on error
 
 
 def _no_elicitation(question: str, options: list[str], exc: Exception | None) -> dict:
+    """Payload telling the agent to ask the question in chat itself, because the client cannot show a choice
+    dialog.
+    """
     out = {"ok": True, "status": "needs_clarification", "question": question, "options": options,
            "action": "Elicitation is unavailable in this client: ask the user this question in your reply and "
                      "wait for the answer."}
@@ -82,12 +107,16 @@ def _no_elicitation(question: str, options: list[str], exc: Exception | None) ->
 
 
 def _err(exc: ClickSenseError) -> ToolResult:
+    """A ClickSenseError as an MCP tool result with isError=true: callers must see a refusal as a failure, not as
+    data.
+    """
     payload = exc.to_dict()
     return ToolResult(content=json.dumps(payload, ensure_ascii=False, default=str), structured_content=payload,
                       is_error=True)
 
 
 def _call(fn, *args, **kwargs):
+    """Run a service method; turn ClickSenseError into an isError result, let anything else propagate (a bug)."""
     try:
         return fn(*args, **kwargs)
     except ClickSenseError as exc:
@@ -104,6 +133,7 @@ def bearer_auth(tokens: list[str]):
     expected = [t.encode() for t in tokens]
 
     def valid(token: str) -> bool:
+        """Constant-time comparison against every accepted token."""
         given = token.encode()
         return any(hmac.compare_digest(given, t) for t in expected)
 
@@ -112,6 +142,10 @@ def bearer_auth(tokens: list[str]):
 
 def build_app(settings: Settings | None = None, service: ClickSense | None = None, *,
               auth: Any = None) -> FastMCP:
+    """Create the FastMCP application: tools, resources, prompts and skills over one ClickSense service.
+
+    `auth` (HTTP transport only) is the bearer-token verifier from bearer_auth(); None for stdio.
+    """
     cs = service or ClickSense(settings or load_settings())
     mcp = FastMCP("clicksense", instructions=INSTRUCTIONS, version="1.0.0", auth=auth)
     mcp.clicksense = cs  # type: ignore[attr-defined]  # handy for tests and embedding
@@ -363,6 +397,7 @@ def build_app(settings: Settings | None = None, service: ClickSense | None = Non
     # ------------------------------------------------------------------ prompts
     @mcp.prompt(name="analyze", description="Answer a data question with the recommended workflow.")
     def analyze(question: str) -> str:
+        """Prompt `analyze`: run the recommended workflow on a question."""
         return (f"Answer this question using the clicksense tools: {question}\n\n"
                 "Start with get_context. Settle every ambiguity before querying (ask me if needed). Prefer "
                 "query_metric when a governed metric fits; otherwise validate_query then run_query. In the answer, "
@@ -381,7 +416,11 @@ def build_app(settings: Settings | None = None, service: ClickSense | None = Non
 
 
 def _register_skill_prompt(mcp: FastMCP, cs: ClickSense, name: str, description: str) -> None:
+    """Expose a skill as an MCP prompt named skill-<name>; the body is read at call time, so edits apply without
+    restart.
+    """
     def prompt(question: str = "") -> str:
+        """The skill body, prefixed with the question when one is given."""
         s = cs.get_skill(name)
         head = f"Follow the skill '{name}'" + (f" for: {question}" if question else "") + "\n\n"
         return head + s["body"]
@@ -408,11 +447,15 @@ def http_auth_or_exit(http, host: str) -> Any:
 
 
 def _die(message: str) -> None:
+    """Print an error for the operator and exit with status 2 (configuration problem)."""
     print(f"clicksense: {message}", file=sys.stderr)
     raise SystemExit(2)
 
 
 def main(argv: list[str] | None = None) -> None:
+    """The `clicksense` command: stdio MCP server by default, `--transport http` for remote clients, `--check`
+    for a status report, `--gen-token` for a new bearer token.
+    """
     ap = argparse.ArgumentParser(prog="clicksense", description="ClickHouse semantic MCP server")
     ap.add_argument("--config", help="Path to clicksense.yaml (default: $CLICKSENSE_CONFIG or ./clicksense.yaml)")
     ap.add_argument("--transport", choices=["stdio", "http"], default="stdio")

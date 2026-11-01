@@ -26,6 +26,9 @@ HELP = "/reset new conversation · /tools list tools · /exit quit"
 
 
 def main(argv: list[str] | None = None) -> None:
+    """The `clicksense-chat` command: parse options, load settings (.env included), apply --model/--base-
+    url/--mcp-url, run the conversation.
+    """
     ap = argparse.ArgumentParser(prog="clicksense-chat", description="Chat with ClickHouse through an "
                                  "OpenAI-compatible LLM and the ClickSense MCP tools.")
     ap.add_argument("--config", help="clicksense.yaml (default: $CLICKSENSE_CONFIG or ./clicksense.yaml)")
@@ -59,12 +62,16 @@ def main(argv: list[str] | None = None) -> None:
 
 
 async def _run(settings, question: str | None, quiet: bool) -> None:
+    """Connect to ClickSense, start the agent, then answer one question (-q) or loop on input. Tool calls are
+    traced in dim text unless --quiet; clarification questions are asked in the terminal.
+    """
     from rich.console import Console
     from rich.markdown import Markdown
 
     console = Console()
 
     def on_event(kind: str, data: dict) -> None:
+        """Print the tool-call trace."""
         if quiet:
             return
         if kind == "tool_call":
@@ -76,6 +83,7 @@ async def _run(settings, question: str | None, quiet: bool) -> None:
             console.print(f"  [dim red]  {data['name']}: {data['error'][:200]}[/dim red]")
 
     async def ask_user(message: str, options: list[str]) -> str | None:
+        """Show a clarification question with numbered options; accept a number, free text, or empty to skip."""
         console.print(f"\n[bold yellow]?[/bold yellow] {message}")
         for i, o in enumerate(options, 1):
             console.print(f"  {i}. {o}")
@@ -92,6 +100,7 @@ async def _run(settings, question: str | None, quiet: bool) -> None:
                       f"@ {resolve_base_url(settings.llm)}[/dim]")
 
         async def turn(q: str) -> None:
+            """One question -> one Markdown-rendered answer."""
             with console.status("thinking…", spinner="dots") if quiet else _null():
                 answer = await agent.ask(q)
             console.print()
@@ -125,6 +134,8 @@ async def _run(settings, question: str | None, quiet: bool) -> None:
 
 
 class _null:
+    """A do-nothing context manager (no spinner when the trace is shown)."""
+
     def __enter__(self):
         return self
 

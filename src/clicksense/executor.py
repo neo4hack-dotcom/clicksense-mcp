@@ -13,6 +13,15 @@ database behind it:
 `wait_end_of_query=1` makes ClickHouse buffer the (already row-capped) result before
 answering: errors arrive as HTTP errors instead of mid-stream garbage, and the
 X-ClickHouse-Summary header carries the real read_rows / read_bytes.
+
+Where the numbers come from: every threshold here is a `limits:` setting (config.py), so tuning
+is a configuration change, not a code change. Internal callers (catalog, resolver, explain) pass
+`admit=False` so metadata lookups never queue behind user queries, and may pass `settings=` to
+tighten limits for one call (e.g. a 10-second cap on value enumeration).
+
+HOW TO SEND AN EXTRA CLICKHOUSE SETTING WITH EVERY QUERY
+  Add a field to `Limits` in config.py and one line in `query_settings()` below. The value must
+  stay within the account profile's CONSTRAINTS, or ClickHouse rejects the query (error 452).
 """
 from __future__ import annotations
 
@@ -35,6 +44,11 @@ from .errors import ClickSenseError, from_clickhouse
 
 @dataclass
 class QueryOutcome:
+    """The result of one query, already JSON-safe (see to_jsonable).
+
+    truncated=True means the row cap was hit: the caller got `fetch_limit - 1` rows and there are
+    more. read_rows / read_bytes come from ClickHouse's summary (None if it sent none)."""
+
     columns: list[str]
     types: list[str]
     rows: list[list[Any]]
@@ -47,6 +61,7 @@ class QueryOutcome:
     truncated_reason: str | None = None
 
     def stats(self) -> dict[str, Any]:
+        """The `stats` block returned with every result (and written to the audit log)."""
         out: dict[str, Any] = {"query_id": self.query_id, "elapsed_ms": round(self.elapsed_ms, 1),
                                "rows": len(self.rows), "cached": self.cached}
         if self.read_rows is not None:
@@ -57,6 +72,11 @@ class QueryOutcome:
 
 
 def to_jsonable(v: Any) -> Any:
+    """ClickHouse values -> JSON values a model can read.
+
+    Decimal -> int when integral, else float (money stays readable; precision beyond 15 digits is
+    not a concern for answers). Dates -> ISO strings. NaN/inf -> null (invalid JSON otherwise).
+    Arrays, tuples, maps are converted recursively; anything else becomes its string form."""
     if v is None or isinstance(v, (bool, int, str)):
         return v
     if isinstance(v, float):
@@ -77,6 +97,12 @@ def to_jsonable(v: Any) -> Any:
 
 
 class CircuitBreaker:
+    """Stops sending queries for `cooldown_s` after `threshold` consecutive infrastructure
+    failures (errors whose `extra["infra"]` is true: timeout, memory, busy, quota, network).
+
+    States reported by server_status: closed (healthy), degraded (some recent failures),
+    open (refusing with `circuit_open` until the cooldown ends). One success closes it."""
+
     def __init__(self, threshold: int, cooldown_s: float):
         self.threshold, self.cooldown_s = threshold, cooldown_s
         self.failures = 0
@@ -85,6 +111,7 @@ class CircuitBreaker:
         self._lock = threading.Lock()
 
     def before(self) -> None:
+        """Raise circuit_open while the breaker is open. Called before every query."""
         with self._lock:
             now = time.monotonic()
             if self.open_until > now:
@@ -97,11 +124,13 @@ class CircuitBreaker:
                 )
 
     def success(self) -> None:
+        """A query succeeded: close the breaker and reset the failure count."""
         with self._lock:
             self.failures = 0
             self.open_until = 0.0
 
     def failure(self, err: ClickSenseError) -> None:
+        """Count an infrastructure failure; open the breaker at the threshold. SQL errors are ignored."""
         if not err.extra.get("infra"):
             return  # bad SQL is not a reason to stop talking to the database
         with self._lock:
@@ -112,10 +141,14 @@ class CircuitBreaker:
 
     @property
     def state(self) -> str:
+        """closed | degraded | open, as shown by server_status."""
         return "open" if self.open_until > time.monotonic() else ("degraded" if self.failures else "closed")
 
 
 class TokenBucket:
+    """Rate limiter: `per_minute` tokens, refilled continuously; each query takes one.
+    A burst up to the full bucket is allowed, then queries are refused with `rate_limited`."""
+
     def __init__(self, per_minute: int):
         self.capacity = max(1, per_minute)
         self.tokens = float(self.capacity)
@@ -124,6 +157,7 @@ class TokenBucket:
         self._lock = threading.Lock()
 
     def take(self) -> None:
+        """Take one token or raise rate_limited with the wait time."""
         with self._lock:
             now = time.monotonic()
             self.tokens = min(self.capacity, self.tokens + (now - self.stamp) * self.rate)
@@ -136,6 +170,9 @@ class TokenBucket:
 
 
 class TTLCache:
+    """Small thread-safe cache: entries expire after `ttl_s`; beyond `max_entries` the least
+    recently used is dropped. ttl_s <= 0 disables it."""
+
     def __init__(self, ttl_s: float, max_entries: int):
         self.ttl, self.max = ttl_s, max_entries
         self._d: OrderedDict[str, tuple[float, Any]] = OrderedDict()
@@ -143,6 +180,7 @@ class TTLCache:
         self.hits = self.misses = 0
 
     def get(self, key: str) -> Any | None:
+        """The cached value, or None if absent or expired (counts hits and misses for server_status)."""
         with self._lock:
             item = self._d.get(key)
             if item and item[0] > time.monotonic():
@@ -155,6 +193,7 @@ class TTLCache:
             return None
 
     def put(self, key: str, value: Any) -> None:
+        """Store a value (no-op when the cache is disabled); evict the least recently used beyond the size."""
         if self.ttl <= 0 or self.max <= 0:
             return
         with self._lock:
@@ -164,6 +203,7 @@ class TTLCache:
                 self._d.popitem(last=False)
 
     def clear(self) -> None:
+        """Empty the cache (refresh_catalog)."""
         with self._lock:
             self._d.clear()
 
@@ -173,6 +213,8 @@ class TTLCache:
 
 @dataclass
 class RunningQuery:
+    """A query in flight, listed by server_status and cancellable by cancel_query."""
+
     query_id: str
     tool: str
     sql: str
@@ -180,6 +222,9 @@ class RunningQuery:
 
 
 class Executor:
+    """The single gateway to ClickHouse (one per server process). Thread-safe: FastMCP runs sync
+    tools in worker threads, so several tools may call `run()` at the same time."""
+
     def __init__(self, settings: Settings):
         self.settings = settings
         self.limits = settings.limits
@@ -198,6 +243,8 @@ class Executor:
     # ------------------------------------------------------------------ connection
     @property
     def client(self):
+        """The clickhouse-connect client, created on first use: the server starts (and answers
+        catalog/knowledge questions from the dictionary) even when ClickHouse is down."""
         if self._client is None:
             with self._client_lock:
                 if self._client is None:
@@ -205,6 +252,8 @@ class Executor:
         return self._client
 
     def _connect(self):
+        """Open the HTTP connection pool and read the server version and the account's readonly
+        level (server_status warns when it is 1: per-query limits would then be ignored)."""
         import clickhouse_connect
         from clickhouse_connect.driver import httputil
 
@@ -224,12 +273,14 @@ class Executor:
         return client
 
     def ping(self) -> bool:
+        """True if ClickHouse answers /ping."""
         try:
             return bool(self.client.ping())
         except ClickSenseError:
             return False
 
     def close(self) -> None:
+        """Close the connection pool (tests, shutdown)."""
         if self._client is not None:
             try:
                 self._client.close()
@@ -240,6 +291,8 @@ class Executor:
     # ------------------------------------------------------------------ settings
     def query_settings(self, tool: str, query_id: str, *, use_query_cache: bool | None = None,
                        overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+        """The ClickHouse settings sent with a query. `overrides` wins (used to tighten a limit for
+        one internal call). Every value must stay within the account profile's CONSTRAINTS."""
         lim = self.limits
         s: dict[str, Any] = {
             "query_id": query_id,
@@ -261,6 +314,7 @@ class Executor:
             "log_comment": f"clicksense:{tool}",
         }
         if use_query_cache if use_query_cache is not None else lim.use_query_cache:
+            # "ignore" = do not cache (instead of failing) queries using now()/rand() or system tables.
             s.update(use_query_cache=1, query_cache_ttl=lim.query_cache_ttl_s,
                      query_cache_nondeterministic_function_handling="ignore",
                      query_cache_system_table_handling="ignore")
@@ -271,6 +325,15 @@ class Executor:
     # ------------------------------------------------------------------ run
     def run(self, sql: str, params: dict[str, Any] | None = None, *, tool: str, fetch_limit: int | None = None,
             use_cache: bool = True, settings: dict[str, Any] | None = None, admit: bool = True) -> QueryOutcome:
+        """Run one SELECT (already accepted by the guard) and return its rows.
+
+        params:      values for {name:Type} placeholders, bound server-side (never formatted in).
+        tool:        name of the calling tool, written to log_comment for system.query_log.
+        fetch_limit: rows expected at most + 1 (from GuardResult.fetch_limit) to detect truncation.
+        use_cache:   look up / store the in-process cache and use ClickHouse's query cache.
+        settings:    per-call overrides of query_settings().
+        admit:       go through the rate limiter and the concurrency slots (False for internal,
+                     cheap metadata queries so they never wait behind user queries)."""
         key = hashlib.sha256(json.dumps([sql, params or {}, fetch_limit, settings or {}], sort_keys=True,
                                         default=str).encode()).hexdigest()
         if use_cache:
@@ -284,6 +347,8 @@ class Executor:
             if not self.slots.acquire(timeout=self.limits.queue_timeout_s):
                 raise ClickSenseError("busy", f"All {self.limits.max_concurrent} query slots are in use.",
                                       "Retry shortly; avoid firing many heavy queries in parallel.")
+        # Our own query ids ("cs-" prefix) are what cancel_query accepts and what you search for
+        # in system.query_log.
         query_id = f"cs-{uuid.uuid4()}"
         self.running[query_id] = RunningQuery(query_id, tool, sql[:500])
         self._remember(query_id)
@@ -311,6 +376,7 @@ class Executor:
         self.breaker.success()
         rows = result.result_rows
         truncated = False
+        # One extra row came back: there are more rows than the cap. Drop it and say so.
         if fetch_limit is not None and len(rows) >= fetch_limit:
             rows, truncated = rows[: fetch_limit - 1], True
         summary = getattr(result, "summary", None) or {}
@@ -366,6 +432,7 @@ class Executor:
         return [{k: (int(v) if v.isdigit() else v) for k, v in zip(head, row)} for row in lines[1:]]
 
     def kill(self, query_id: str) -> dict[str, Any]:
+        """KILL QUERY for an id this process issued (the last 2000). Never other users' queries."""
         if query_id not in self.issued:
             raise ClickSenseError("not_ours", "This server only cancels queries it started.",
                                   "Use the query_id returned by run_query or server_status.")
@@ -376,12 +443,14 @@ class Executor:
         return {"ok": True, "query_id": query_id, "status": "kill requested"}
 
     def _remember(self, query_id: str) -> None:
+        """Record an issued query id (the last 2000) so cancel_query can check ownership."""
         self.issued[query_id] = time.time()
         while len(self.issued) > 2000:
             self.issued.popitem(last=False)
 
 
 def _int(v: Any) -> int | None:
+    """int(v), or None for missing/non-numeric values in ClickHouse's summary."""
     try:
         return int(v)
     except (TypeError, ValueError):

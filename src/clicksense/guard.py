@@ -16,6 +16,22 @@ Parsing is sqlglot first (offline, gives us an AST for linting). sqlglot does no
 ClickHouse construct (e.g. `LIMIT n BY x LIMIT m`), so when it fails and the policy allows,
 ClickHouse's own parser is asked (`EXPLAIN AST`, parse-only, reads no data). If both fail the
 statement is refused.
+
+The order of checks in `Guard.check` (each one raises `Rejected` with a hint):
+  1. normalise: non-empty, length limit, trailing ';' removed;
+  2. text checks on the SQL with string literals and comments blanked out (so a ';' or the word
+     SETTINGS inside a string does not count): stacked statements, SETTINGS/FORMAT/INTO OUTFILE,
+     forbidden function names - a safety net that works even if the parser misses something;
+  3. parse (sqlglot, else ClickHouse) and walk the tree: statement type, clauses, functions;
+  4. tables: system databases, allow-list, deny-list (CTE names are not tables);
+  5. PII columns in the SELECT list;
+  6. the row cap.
+
+HOW TO CHANGE WHAT IS ALLOWED
+  * Allow/deny databases or tables, allow a table function: `policy:` in clicksense.yaml, no code.
+  * Forbid a new function everywhere: add its lower-case name to FORBIDDEN_FUNCTIONS.
+  * A new refusal: raise Rejected("stable_code", "what is wrong", "what to do instead") and add
+    an attack case to tests/test_guard.py.
 """
 from __future__ import annotations
 
@@ -33,6 +49,8 @@ SYSTEM_DATABASES = {"system", "information_schema"}
 
 # Functions that read from or write to the outside world, or exist only to burn time.
 # Matched case-insensitively, in the AST and, as a safety net, in literal-stripped text.
+# Names listed in policy.allowed_table_functions (default: numbers) are let through, and only
+# when used as a table in FROM.
 FORBIDDEN_FUNCTIONS = {
     "url", "urlcluster", "s3", "s3cluster", "gcs", "oss", "cosn", "azureblobstorage", "azureblobstoragecluster",
     "hdfs", "hdfscluster", "file", "filecluster", "remote", "remotesecure", "cluster", "clusterallreplicas",
@@ -47,17 +65,26 @@ _TEXT_FORBIDDEN = re.compile(
 )
 # Shaped like the clauses, so a `format(...)` call or a column named `settings` passes.
 _CLAUSES = re.compile(r"\b(SETTINGS)\s+\w+\s*=|\b(FORMAT)\s+[A-Za-z]\w*\s*$|\b(INTO\s+OUTFILE)\b", re.IGNORECASE)
+# Pieces of SQL blanked out before the text checks: string literals ('it''s', 'a\'b') and comments.
 _STRINGS = re.compile(r"'(?:[^'\\]|\\.|'')*'")
 _COMMENTS = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
+# "db.table" references, used by the ClickHouse-parser fallback to catch system.* access.
 _QUALIFIED = re.compile(r"\b([A-Za-z_][\w]*)\s*\.\s*([A-Za-z_][\w]*)")
 
 
 def strip_literals(sql: str) -> str:
+    """The SQL with comments removed and every string literal replaced by '' (keeps the structure)."""
     return _STRINGS.sub("''", _COMMENTS.sub(" ", sql))
 
 
 @dataclass
 class GuardResult:
+    """The verdict for an accepted statement.
+
+    `sql` is what the executor runs; `original` is the caller's text (used for EXPLAIN, which must
+    not see our LIMIT wrapper). `tree` is the sqlglot AST, None when ClickHouse parsed it (then the
+    advisor in lint.py cannot run its static checks)."""
+
     sql: str  # what will actually run
     original: str
     tables: list[tuple[str, str]]  # (database, table), real tables only
@@ -68,10 +95,13 @@ class GuardResult:
 
     @property
     def fetch_limit(self) -> int | None:
+        """Rows to fetch: one more than the cap, so the executor can tell 'exactly n' from 'more than n'."""
         return None if self.row_cap is None else self.row_cap + 1
 
 
 def _func_name(node: exp.Func) -> str:
+    """The function name as written. sqlglot keeps unknown functions (most ClickHouse ones, and
+    all the dangerous ones) as Anonymous nodes whose name is the text; known ones have a class."""
     if isinstance(node, (exp.Anonymous, exp.AnonymousAggFunc, exp.ParameterizedAgg, exp.CombinedAggFunc,
                          exp.CombinedParameterizedAgg)):
         return str(node.name)
@@ -79,6 +109,7 @@ def _func_name(node: exp.Func) -> str:
 
 
 def _literal_int(node: exp.Expression | None) -> int | None:
+    """The value of an integer literal (LIMIT 10 -> 10), else None (LIMIT {n:UInt32} -> None)."""
     if isinstance(node, exp.Literal) and not node.is_string:
         try:
             return int(node.this)
@@ -88,6 +119,12 @@ def _literal_int(node: exp.Expression | None) -> int | None:
 
 
 class Guard:
+    """Stateless checker, built once per server from the policy.
+
+    pii_columns(db, table) -> names of PII columns (from the catalog/dictionary).
+    server_parse(sql) -> ClickHouse's `EXPLAIN AST` text, used when sqlglot cannot parse.
+    Both are injected so the guard stays testable without a database."""
+
     def __init__(
         self,
         policy: Policy,
@@ -108,6 +145,7 @@ class Guard:
 
     # ------------------------------------------------------------------ public
     def check(self, sql: str, row_cap: int) -> GuardResult:
+        """Accept (and bound to `row_cap` rows) or raise Rejected. See the module docstring."""
         text = self._normalise(sql)
         stripped = strip_literals(text)
         self._text_checks(stripped)
@@ -126,6 +164,7 @@ class Guard:
             kind = type(tree).__name__.upper()
             raise Rejected("not_a_select", f"Only SELECT queries are allowed (got {kind}).",
                            "This server is read-only. Use SELECT, WITH ... SELECT or UNION ALL.")
+        # Walk every node: a write can hide in a subquery or a CTE, a function anywhere.
         for node in tree.walk():
             if isinstance(node, (exp.Insert, exp.Create, exp.Drop, exp.Delete, exp.Update, exp.Alter,
                                  exp.Command, exp.Into, exp.Set, exp.TruncateTable)):
@@ -144,6 +183,7 @@ class Guard:
                     raise Rejected("forbidden_function", f"Function {name}() is not allowed.",
                                    "External table functions and sleep() are disabled. Query tables directly.")
 
+        # `WITH recent AS (...) SELECT ... FROM recent`: `recent` is a CTE, not a table to check.
         cte_names = {c.alias_or_name.lower() for c in tree.find_all(exp.CTE)}
         tables = self._collect_tables(tree, cte_names)
         self._check_pii(tree, tables)
@@ -152,6 +192,7 @@ class Guard:
 
     # ------------------------------------------------------------------ helpers
     def _normalise(self, sql: str) -> str:
+        """Trim, enforce the size limit, drop trailing semicolons (harmless and very common)."""
         if not sql or not sql.strip():
             raise Rejected("empty", "Empty SQL.")
         if len(sql) > self.max_sql_chars:
@@ -163,6 +204,7 @@ class Guard:
         return text
 
     def _text_checks(self, stripped: str) -> None:
+        """Checks on the literal-stripped text: they hold even when no parser understands the SQL."""
         if ";" in stripped:
             raise Rejected("multiple_statements", "Exactly one statement per call.",
                            "Remove ';' separators and send statements one at a time.")
@@ -178,9 +220,11 @@ class Guard:
                                "External table functions and sleep() are disabled. Query tables directly.")
 
     def _is_allowed_table_function(self, node: exp.Func, name: str) -> bool:
+        """`numbers(10)` is fine in FROM (if allowed by policy), never as a scalar function."""
         return name in self.allowed_tf and isinstance(node.parent, exp.Table)
 
     def _check_table(self, db: str, name: str) -> None:
+        """System databases, then the allow-list, then the deny-list."""
         dbl = db.lower()
         if dbl in SYSTEM_DATABASES:
             raise Rejected("system_table", f"Direct access to {db}.{name} is not allowed.",
@@ -192,6 +236,8 @@ class Guard:
             raise Rejected("table_denied", f"Table {db}.{name} is not available through this server.")
 
     def _collect_tables(self, tree: exp.Expression, cte_names: set[str]) -> list[tuple[str, str]]:
+        """Every real table the query reads, as (database, table), each checked. Unqualified
+        names belong to connection.database."""
         seen: list[tuple[str, str]] = []
         for t in tree.find_all(exp.Table):
             if isinstance(t.this, exp.Func):  # table function: checked with the functions above
@@ -212,6 +258,10 @@ class Guard:
         return seen
 
     def _check_pii(self, tree: exp.Expression, tables: list[tuple[str, str]]) -> None:
+        """Refuse PII columns in the SELECT list, unless inside an aggregate (count(email) is fine,
+        email is not). Filtering on them (WHERE email = ...) is allowed. A `SELECT *` over a table
+        with PII is refused unless `* EXCEPT (...)` removes every PII column. Matching is by
+        column name across the tables of the query: conservative on purpose."""
         if self.policy.pii == "allow" or not tables:
             return
         pii: dict[str, str] = {}
@@ -241,6 +291,8 @@ class Guard:
 
     @staticmethod
     def _top_limit(tree: exp.Expression) -> int | None:
+        """The literal LIMIT of the outermost query, if any (LIMIT n BY x is a per-group limit,
+        not a row cap, so it does not count)."""
         limit = tree.args.get("limit")
         if isinstance(limit, exp.Limit) and not limit.args.get("expressions"):  # not LIMIT n BY
             return _literal_int(limit.expression)
@@ -248,13 +300,23 @@ class Guard:
 
     def _bound(self, text: str, tables, row_cap: int, user_limit: int | None, *, parser: str,
                tree: exp.Expression | None) -> GuardResult:
+        # The caller's own LIMIT is already within the cap: run the text untouched.
+        """Apply the row cap: keep the caller's LIMIT when it is within the cap, else wrap the query."""
         if user_limit is not None and user_limit <= row_cap:
             return GuardResult(text, text, tables, None, parser, tree)
+        # Otherwise wrap rather than rewrite: regenerating SQL from the AST could change its
+        # meaning or its {param:Type} placeholders. ClickHouse pushes the outer LIMIT down.
         wrapped = f"SELECT * FROM (\n{text}\n) LIMIT {row_cap + 1}"
         return GuardResult(wrapped, text, tables, row_cap, parser, tree)
 
     # ------------------------------------------------------------------ fallback
     def _check_via_server(self, text: str, stripped: str, row_cap: int, sqlglot_error: str) -> GuardResult:
+        """Fallback when sqlglot cannot parse: ask ClickHouse for the AST (`EXPLAIN AST`, which
+        parses without reading data) and apply the same table/function/SETTINGS rules to its
+        indented text form:
+            SelectWithUnionQuery (children 1)
+              ... TableIdentifier shop.orders
+              ... Function url (children 1)"""
         try:
             ast = self.server_parse(text)  # type: ignore[misc]
         except Exception as exc:

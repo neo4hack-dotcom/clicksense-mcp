@@ -9,7 +9,6 @@ from pathlib import Path
 
 from reportlab.graphics.shapes import Drawing, Line, Polygon, Rect, String
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
@@ -310,6 +309,7 @@ docker compose exec -T clickhouse clickhouse-client --multiquery < dev/seed.sql
 h2("2.4 Configure and check")
 code("""
 cp clicksense.example.yaml clicksense.yaml
+cp .env.example .env                  # demo connection: port 18123, user clicksense, database shop
 .venv/bin/clicksense --check          # connection, readonly level, limits, semantic layer counts
 .venv/bin/python -m pytest -q         # 100 tests; live tests are skipped if ClickHouse is down
 """)
@@ -437,6 +437,11 @@ code("""
 
 # ============================================================================== 3 configuration
 h1("3. Configuration")
+callout("Generated from the code", "Every setting below is declared, with its description and its environment "
+        "variable, in src/clicksense/config.py. <font face='Courier'>clicksense-admin config --example</font> prints "
+        "the fully commented file (it is clicksense.example.yaml) and <font face='Courier'>config --show</font> the "
+        "effective values with secrets masked. A test fails if the example file and the code drift apart.",
+        OK_SOFT, colors.HexColor("#047857"))
 p("Configuration is one YAML file. <font face='Courier'>${VAR}</font> and <font face='Courier'>${VAR:-default}</font> "
   "are substituted from the environment; a variable without a default that is not set stops the server at start "
   "(no silent empty password). Relative paths are resolved against the directory of the configuration file.")
@@ -745,6 +750,11 @@ p("Skills are exposed three ways — as tools (list_skills / get_skill), as prom
 
 # ============================================================================== 7 authoring
 h1("7. Authoring the semantic layer")
+callout("Step-by-step recipes", "This chapter is the reference. The task-by-task recipes (document a table, add a "
+        "metric, a term, an example, a rule, a skill, review the inbox, ship a change) are in the companion "
+        "<b>ClickSense Maintenance Guide</b> (docs/UPDATING.md, also as PDF). The tool that does the tedious parts is "
+        "<font face='Courier'>clicksense-admin kb</font>: bootstrap, new, validate --live, search, resolve, inbox.",
+        OK_SOFT, colors.HexColor("#047857"))
 p("Everything lives in <font face='Courier'>semantic/</font> as plain files: review them in pull requests like "
   "code. Files are re-read automatically when they change (checked at most every 2 seconds); "
   "<font face='Courier'>refresh_catalog</font> forces a reload. Load errors are reported by "
