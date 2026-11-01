@@ -200,3 +200,26 @@ def test_bootstrap_documents_a_table_from_clickhouse(tmp_path, kb):
     (kb / "dictionary" / "shop.yaml").write_text("tables:\n", encoding="utf-8")
     _, path = bootstrap_table(cs, "shop.products")
     assert "shop.products" in Knowledge(kb).tables
+
+
+def test_import_prompt_only_names_things_that_exist():
+    # docs/PROMPT-import-knowledge.md drives an agent through clicksense-admin and the key lists:
+    # if a command, a flag or a key list is renamed, the prompt must be updated too.
+    import re
+
+    from clicksense import knowledge
+
+    text = (ROOT / "docs" / "PROMPT-import-knowledge.md").read_text(encoding="utf-8")
+    parser_help = admin.build_parser().format_help()
+    kb = next(a for a in admin.build_parser()._subparsers._group_actions[0].choices.values()
+              if a.prog.endswith(" kb"))
+    kb_cmds = set(kb._subparsers._group_actions[0].choices)
+    for cmd in set(re.findall(r"clicksense-admin kb (\w+)", text)):
+        assert cmd in kb_cmds, cmd
+    assert "config" in parser_help and "--print-only" in kb._subparsers._group_actions[0].choices["bootstrap"].format_help()
+    for name in re.findall(r"\b([A-Z]+_KEYS)\b", text):
+        assert hasattr(knowledge, name), name
+    for path in re.findall(r"\b((?:docs|semantic|src/clicksense/templates|dev)/[\w./-]+\.(?:md|sql))", text):
+        assert (ROOT / path).exists(), path
+    for script in ("admin-windows.bat", "check-windows.bat"):
+        assert (ROOT / script).exists()
