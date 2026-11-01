@@ -1,0 +1,10 @@
+  # --- New verified example: a question and the SQL a data person checked. get_context hands the
+  # closest ones to the agent as models, so only add SQL you would sign. `kb validate --live`
+  # re-checks that it still runs. ---
+  - question: {{name}}
+    tags: []                         # words that help find it (metric names, dimensions...)
+    sql: |
+      SELECT TODO
+      FROM TODO
+      WHERE TODO_date_column >= toStartOfMonth(today())   -- always filter on the time column
+    # notes: why it is written this way (optional)

@@ -5,6 +5,22 @@ the same thing in every answer. Filter values are resolved against stored values
 (`France` -> 'FR') and bound as typed parameters; an ambiguous value stops compilation with
 the candidates instead of guessing. The generated SQL then goes through the same guard and
 executor as hand-written SQL.
+
+What a compiled query looks like (revenue by channel, France, last month):
+
+    SELECT o.`channel` AS `channel`, sum(o.amount_eur) AS `revenue`
+    FROM `shop`.`orders` AS o
+    WHERE (o.status = 'completed')                                    <- metric filters
+      AND o.`order_date` >= {p_from:Date} AND o.`order_date` < {p_to:Date}   <- period
+      AND o.`country` IN {f0:Array(String)}                           <- filters, bound
+    GROUP BY `channel` ORDER BY `revenue` DESC LIMIT 100               params: f0 = ['FR']
+
+HOW TO EXTEND
+  * A new metric, dimension or join: edit metrics.yaml / the dictionary, no code
+    (`clicksense-admin kb new metric NAME` scaffolds it).
+  * A new period name ("last_fiscal_year"...): add it to the `table` dict in resolve_period().
+  * A new time grain: add a ClickHouse expression to GRAINS ({c} is the time column).
+  * A new filter operator: add it to OPS (left: what callers write, right: the SQL operator).
 """
 from __future__ import annotations
 
@@ -18,16 +34,26 @@ from .errors import ClickSenseError
 from .knowledge import Knowledge, fold
 from .resolver import Resolver
 
+# Time buckets for `grain`: ClickHouse expression applied to the time column ({c}).
 GRAINS = {
     "hour": "toStartOfHour({c})", "day": "toDate({c})", "week": "toMonday({c})",
     "month": "toStartOfMonth({c})", "quarter": "toStartOfQuarter({c})", "year": "toStartOfYear({c})",
 }
+# Filter operators accepted in query_metric filters ({"amount_eur": {">=": 100}}) -> SQL.
 OPS = {"=": "=", "!=": "!=", ">": ">", ">=": ">=", "<": "<", "<=": "<=", "in": "IN", "not_in": "NOT IN"}
+# A dimension name usable as-is as an output column alias.
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def resolve_period(period: str | dict[str, str] | None, today: dt.date | None = None) -> tuple[dt.date, dt.date] | None:
-    """-> [start, end) dates. Relative names or {"from": "YYYY-MM-DD", "to": "YYYY-MM-DD" (inclusive)}."""
+    """A period -> [start, end) dates (end exclusive), or None when no period is given.
+
+    Accepted: today, yesterday, this_week, last_week (weeks start on Monday), this_month/mtd,
+    last_month, this_quarter/qtd, last_quarter, this_year/ytd, last_year, last_N_days,
+    last_N_weeks, last_N_months (the current day/month included), or an explicit
+    {"from": "YYYY-MM-DD", "to": "YYYY-MM-DD"} where `to` is INCLUSIVE (people say "to March 31").
+    `today` is the server's local date; the resolved range is returned to the agent, so the
+    answer can state it explicitly."""
     if not period:
         return None
     today = today or dt.date.today()
@@ -69,12 +95,17 @@ def resolve_period(period: str | dict[str, str] | None, today: dt.date | None = 
 
 
 def _add_months(d: dt.date, n: int) -> dt.date:
+    """First-of-month arithmetic (d is always a 1st here, so no day overflow)."""
     y, m = divmod(d.month - 1 + n, 12)
     return d.replace(year=d.year + y, month=m + 1)
 
 
 @dataclass
 class Dimension:
+    """Something a metric can be grouped or filtered by: a column of the metric's table, or a
+    dictionary `dimensions:` entry (an SQL expression, possibly on a joined table). `column` points
+    at the stored values used to resolve filter words; `join` names the join to add."""
+
     name: str
     sql: str
     join: str | None
@@ -85,6 +116,9 @@ class Dimension:
 
 @dataclass
 class Compiled:
+    """The compiled query and what query_metric reports back: params, the metric definitions used,
+    the resolved period and every user-word -> stored-value resolution."""
+
     sql: str
     params: dict[str, Any]
     metrics: list[dict[str, Any]]
@@ -94,6 +128,8 @@ class Compiled:
 
 
 class MetricCompiler:
+    """Turns query_metric arguments into one parameterised SQL statement."""
+
     def __init__(self, knowledge: Knowledge, catalog: Catalog, resolver: Resolver, default_db: str):
         self.k = knowledge
         self.catalog = catalog
@@ -101,6 +137,7 @@ class MetricCompiler:
         self.default_db = default_db
 
     def get(self, name: str) -> dict[str, Any]:
+        """A metric by name, label or synonym (case/accent-insensitive)."""
         self.k.maybe_reload()
         if name in self.k.metrics:
             return self.k.metrics[name]
@@ -112,6 +149,7 @@ class MetricCompiler:
                               f"Available: {', '.join(sorted(self.k.metrics)) or 'none defined'}.")
 
     def dimensions_for(self, table: Table) -> dict[str, Dimension]:
+        """Every dimension of a table: its columns, then its declared dimensions (which win)."""
         alias = table.spec.get("alias", "t")
         dims: dict[str, Dimension] = {}
         for c in table.columns.values():
@@ -134,6 +172,9 @@ class MetricCompiler:
                 filters: dict[str, Any] | None = None, period: str | dict[str, str] | None = None,
                 grain: str | None = None, order_by: str | None = None, descending: bool = True,
                 limit: int = 100) -> Compiled:
+        """Compile. Rules: metrics in one call share a table and built-in filters; dimensions must
+        exist (and be allowed by every metric's `dimensions:` list, columns always allowed); filter
+        words are resolved or the call stops with needs_clarification; values are always bound."""
         if not metrics:
             raise ClickSenseError("no_metric", "At least one metric is required.", "See list_metrics.")
         specs = [self.get(m) for m in metrics]
@@ -160,6 +201,7 @@ class MetricCompiler:
         resolutions: list[dict[str, Any]] = []
 
         def need_join(name: str | None) -> None:
+            """Add a declared join once (in first-use order)."""
             if not name or name in joins:
                 return
             if name not in (table.spec.get("joins") or {}):
@@ -167,6 +209,9 @@ class MetricCompiler:
             joins.append(name)
 
         def dim(name: str) -> Dimension:
+            """A dimension by name, checked against the metrics' allowed dimensions; unknown names get close
+            matches.
+            """
             if name not in dims:
                 from rapidfuzz import process
 
@@ -237,6 +282,8 @@ class MetricCompiler:
 
     def _filter(self, d: Dimension, value: Any, pname: str, params: dict[str, Any],
                 resolutions: list[dict[str, Any]]) -> str:
+        """One WHERE condition for a filter: resolve words to stored values for text columns (raise
+        needs_clarification on ambiguity, record each resolution), then bind as {fN:Type}."""
         op = "IN"
         if isinstance(value, dict):
             if len(value) != 1:
@@ -275,6 +322,8 @@ class MetricCompiler:
 
 
 def _param_type(col: Column | None) -> str:
+    """The ClickHouse type of a {param:Type} placeholder for a column (Enum -> String,
+    Decimal -> Float64, LowCardinality/Nullable stripped)."""
     if col is None:
         return "String"
     bt = col.base_type

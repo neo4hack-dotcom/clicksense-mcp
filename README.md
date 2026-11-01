@@ -10,7 +10,10 @@ An MCP server (FastMCP, Python) that lets an AI agent answer business questions 
   revenue, orders or units?), validation before execution, asking the user through MCP
   elicitation.
 
-The full user guide is in [docs/ClickSense-User-Guide.pdf](docs/ClickSense-User-Guide.pdf).
+The full user guide is in [docs/ClickSense-User-Guide.pdf](docs/ClickSense-User-Guide.pdf); keeping
+ClickSense up to date (settings, tables, metrics, terms, examples, rules, skills) is explained step
+by step in [docs/UPDATING.md](docs/UPDATING.md) (also as
+[docs/ClickSense-Maintenance-Guide.pdf](docs/ClickSense-Maintenance-Guide.pdf)).
 
 ## Quick start (≈ 2 minutes)
 
@@ -32,8 +35,10 @@ scripts/dev-clickhouse.sh start && scripts/dev-clickhouse.sh seed
 (or `docker compose up -d`, then `docker compose exec -T clickhouse clickhouse-client --multiquery < dev/seed.sql`)
 
 ```bash
-cp clicksense.example.yaml clicksense.yaml
+cp clicksense.example.yaml clicksense.yaml && cp .env.example .env
 ```
+
+(`.env.example` holds the demo connection: port 18123, user `clicksense`, database `shop`.)
 
 ```bash
 .venv/bin/clicksense --check
@@ -44,7 +49,7 @@ cp clicksense.example.yaml clicksense.yaml
 ```
 
 `--check` prints the server state (connection, `readonly` level, limits, semantic-layer
-content). The 131 tests cover the guard (55 attacks), the offline semantic layer, the MCP
+content). The 158 tests cover the guard (55 attacks), the offline semantic layer, the MCP
 protocol and — when the local database is running — real integration (circuit breaker,
 cancellation, pre-flight estimate, ClickHouse limits).
 A scripted fake LLM covers the OpenAI-compatible bridge without any API key, and
@@ -264,9 +269,23 @@ each entry you add improves answers. Start with `time_column`, caveats, `values`
 `value_synonyms` of frequently filtered columns, and 3 to 5 metrics. Synonyms are user
 vocabulary and can be multilingual (the demo keeps a few French words to show it).
 
-Configuration: `clicksense.example.yaml` (`${VAR}` / `${VAR:-default}` read from the
-environment). Direct variables: `CLICKSENSE_HOST`, `CLICKSENSE_PORT`, `CLICKSENSE_USER`,
-`CLICKSENSE_PASSWORD`, `CLICKSENSE_DATABASE`, `CLICKSENSE_CONFIG`.
+`clicksense-admin` does the tedious parts (`admin-windows.bat` on Windows):
+
+```bash
+clicksense-admin kb bootstrap shop.returns       # document a table from ClickHouse itself
+clicksense-admin kb new metric net_revenue       # or term / example / knowledge / skill, from a commented template
+clicksense-admin kb validate --live              # typos, broken references, SQL that no longer runs
+clicksense-admin kb search "net revenue by channel last month"   # what the agent will find
+clicksense-admin kb resolve shop.orders country France uk        # how words map to stored values
+```
+
+Files under `semantic/` are picked up by the running server within seconds. The step-by-step
+recipes are in [docs/UPDATING.md](docs/UPDATING.md).
+
+Configuration: every setting is documented in the code (`src/clicksense/config.py`) and in the
+generated `clicksense.example.yaml` (`clicksense-admin config --example`; `config --show` prints
+the effective values). `${VAR}` / `${VAR:-default}` are read from the environment and `.env`;
+each setting with an `[env: ...]` mark can be overridden by that variable.
 
 ## Known limits
 
@@ -296,4 +315,10 @@ src/clicksense/
   audit.py      JSONL audit log (without parameter values)
   agent.py      OpenAI-compatible bridge (MCP client + tool-calling loop)
   chat.py       clicksense-chat command line
+  kbtools.py    validate / scaffold / bootstrap the semantic layer
+  admin.py      clicksense-admin command line
+  templates/    commented templates for `clicksense-admin kb new`
+
+Each module starts with a docstring explaining its role and how to extend it; every function and
+class is documented. `src/clicksense/__init__.py` has the map.
 ```

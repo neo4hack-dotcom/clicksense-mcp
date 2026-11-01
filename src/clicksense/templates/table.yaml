@@ -1,0 +1,20 @@
+# Prefer `clicksense-admin kb bootstrap db.table`: it fills this from ClickHouse itself.
+{{name}}:
+  description: TODO What one row is and where the data comes from.
+  grain: TODO one row per ...
+  alias: t                           # short alias used in metric expressions (o for orders...)
+  time_column: TODO                  # date/datetime column for periods (usually the partition key)
+  # owner: TODO team
+  # refresh: TODO e.g. daily at 06:00 Europe/Paris
+  caveats: []                        # traps a new analyst would fall into
+  # joins:
+  #   other: {table: db.other, alias: x, on: "t.other_id = x.id"}
+  # dimensions:
+  #   other_name: {sql: x.name, join: other, column: db.other.name}
+  columns:
+    TODO_column:
+      description: TODO
+      # unit: EUR
+      # pii: true                    # never returned raw (filter/aggregate only)
+      # values: {STORED: Label}      # stored value -> meaning
+      # value_synonyms: {STORED: [words users say]}

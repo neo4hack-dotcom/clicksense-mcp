@@ -49,6 +49,9 @@ Rules:
 
 
 def resolve_api_key(llm: LLM) -> str:
+    """The LLM API key: llm.api_key, else $CLICKSENSE_LLM_API_KEY, else $OPENAI_API_KEY. Local servers
+    (localhost) need none.
+    """
     key = llm.api_key or os.environ.get("CLICKSENSE_LLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
     if key:
         return key
@@ -59,10 +62,14 @@ def resolve_api_key(llm: LLM) -> str:
 
 
 def resolve_base_url(llm: LLM) -> str:
+    """The API base URL: llm.base_url, else $OPENAI_BASE_URL, else OpenAI."""
     return llm.base_url or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
 
 
 def to_openai_tool(tool: mcp_types.Tool) -> dict[str, Any]:
+    """An MCP tool -> an OpenAI function tool (name, description cut to 1024 chars, JSON schema of the arguments
+    without $schema/title, which some providers reject).
+    """
     schema = getattr(tool, "input_schema", None) or getattr(tool, "inputSchema", None) or {"type": "object"}
     schema = {k: v for k, v in schema.items() if k not in ("$schema", "title")}
     schema.setdefault("properties", {})
@@ -88,6 +95,7 @@ def elicitation_handler(ask_user: AskUser):
     """MCP elicitation -> ask_user(question, options). Used by ask_user_to_clarify."""
 
     async def handler(message, response_type, params, context):
+        """Elicitation callback: pull the options out of the requested schema and ask the person."""
         schema = getattr(params, "requested_schema", None) or getattr(params, "requestedSchema", None) or {}
         prop = (schema.get("properties") or {}).get("value", {})
         options = list(prop.get("enum") or [o.get("const") for o in prop.get("oneOf", []) if "const" in o])
@@ -106,7 +114,7 @@ async def connect(settings: Settings, ask_user: AskUser | None = None) -> AsyncI
     auth = None
     if settings.llm.mcp_url:
         target: Any = settings.llm.mcp_url
-        auth = settings.llm.mcp_token
+        auth = settings.llm.mcp_token or None  # an empty ${VAR:-} must not send an empty bearer
     else:
         from .server import build_app
 
@@ -116,7 +124,17 @@ async def connect(settings: Settings, ask_user: AskUser | None = None) -> AsyncI
 
 
 class Agent:
+    """A conversation between one OpenAI-compatible model and the ClickSense tools.
+
+    start() lists the tools and builds the system prompt; ask(question) runs one user turn (history is kept
+    for follow-ups); reset() starts a new conversation. on_event(kind, data) reports tool_call / tool_result /
+    tool_error / answer / max_steps, for display or logging.
+    """
+
     def __init__(self, llm: LLM, client: Client, *, openai_client: Any = None, on_event: OnEvent | None = None):
+        """openai_client: inject an object with .chat.completions.create (tests use a scripted fake); by default
+        an AsyncOpenAI client on the configured endpoint.
+        """
         self.llm = llm
         self.client = client
         self.on_event = on_event or (lambda kind, data: None)
@@ -130,6 +148,7 @@ class Agent:
         self.messages: list[dict[str, Any]] = []
 
     async def start(self) -> None:
+        """List the MCP tools, convert them, and build the system prompt (GUIDANCE + the server's instructions)."""
         self.tools = [to_openai_tool(t) for t in await self.client.list_tools()]
         init = getattr(self.client, "initialize_result", None)
         instructions = getattr(init, "instructions", None) or ""
@@ -137,6 +156,7 @@ class Agent:
         self.reset()
 
     def reset(self) -> None:
+        """Forget the conversation, keep the system prompt."""
         self.messages = [{"role": "system", "content": self.system}]
 
     async def ask(self, question: str) -> str:
@@ -176,6 +196,9 @@ class Agent:
         self.messages.append({"role": "tool", "tool_call_id": call_id, "content": await self._run(call)})
 
     async def _run(self, call: Any) -> str:
+        """Execute one tool call from the model. Bad JSON arguments and failing tools are returned to the model
+        as error payloads (it can correct itself) instead of raising.
+        """
         name = call.function.name
         try:
             args = json.loads(call.function.arguments or "{}")
@@ -197,10 +220,14 @@ class Agent:
 
 
 class _Fn:
+    """Minimal stand-in for an OpenAI tool-call function, used by _inject."""
+
     def __init__(self, name: str, arguments: str):
         self.name, self.arguments = name, arguments
 
 
 class _Call:
+    """Minimal stand-in for an OpenAI tool call, used by _inject."""
+
     def __init__(self, call_id: str, name: str, arguments: str):
         self.id, self.function = call_id, _Fn(name, arguments)

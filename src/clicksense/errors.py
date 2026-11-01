@@ -3,6 +3,20 @@
 Every error carries a machine-readable `code`, a human `message` and, wherever we can say it,
 a `hint`: what the caller should do instead. A refusal that does not say what would have been
 accepted just makes the model guess again.
+
+Where errors come from:
+* the guard and the tools raise `Rejected` / `ClickSenseError` themselves (codes such as
+  `not_a_select`, `too_expensive`, `needs_clarification`);
+* ClickHouse errors are translated by `from_clickhouse()` using the table `_CH_CODES` below.
+
+How they reach the caller: server.py turns every ClickSenseError into an MCP result with
+`isError: true` and the payload of `to_dict()` ({ok: false, error, message, hint, ...extra}).
+
+HOW TO HANDLE A NEW CLICKHOUSE ERROR
+  Add a line to `_CH_CODES`: the numeric code from the ClickHouse message ("Code: 241"), a short
+  stable name (it becomes `error` in the payload: never rename an existing one, agents and tests
+  rely on them), whether it is an *infrastructure* failure (load/availability: counts towards the
+  circuit breaker) and a hint written as an instruction to the agent.
 """
 from __future__ import annotations
 
@@ -11,6 +25,15 @@ from typing import Any
 
 
 class ClickSenseError(Exception):
+    """A refusal or failure that a tool reports to its caller instead of crashing.
+
+    code:    stable machine-readable name ("timeout", "unknown_column", "needs_clarification").
+    message: what happened, for a person or a model.
+    hint:    what to do instead. Always give one when you can: it is what lets an agent recover.
+    extra:   any structured detail (candidates, estimate, findings, query_id, infra...). Copied
+             into the payload, so keep values JSON-serialisable.
+    """
+
     def __init__(self, code: str, message: str, hint: str | None = None, **extra: Any):
         super().__init__(message)
         self.code = code
@@ -19,6 +42,7 @@ class ClickSenseError(Exception):
         self.extra = extra
 
     def to_dict(self) -> dict[str, Any]:
+        """The payload returned to the MCP client (with isError set by server.py)."""
         out: dict[str, Any] = {"ok": False, "error": self.code, "message": self.message}
         if self.hint:
             out["hint"] = self.hint
@@ -30,8 +54,10 @@ class Rejected(ClickSenseError):
     """The guard refused the statement before it reached ClickHouse."""
 
 
-# ClickHouse error codes we translate. `infra=True` means the failure is about load or
-# availability, not about the SQL: those feed the circuit breaker.
+# ClickHouse error codes we translate: code -> (name, infra, hint).
+# `infra=True` means the failure is about load or availability, not about the SQL: only those feed
+# the circuit breaker (executor.CircuitBreaker). Bad SQL repeated 100 times must not pause the
+# server for everybody; ten timeouts in a row must.
 _CH_CODES: dict[int, tuple[str, bool, str]] = {
     159: ("timeout", True, "The query exceeded max_execution_time. Add a filter on the partition/time "
                            "column or the first ORDER BY key column, aggregate earlier, or use SAMPLE."),
@@ -72,6 +98,11 @@ _CODE_RE = re.compile(r"Code:\s*(\d+)")
 
 
 def from_clickhouse(exc: Exception) -> ClickSenseError:
+    """Turn any exception raised while talking to ClickHouse into a ClickSenseError.
+
+    1. find the numeric code ("Code: 159") and look it up in _CH_CODES;
+    2. keep only the human part of the message (the driver wraps it in URL, version, stack...);
+    3. without a code, recognise network failures by their wording (they feed the breaker)."""
     text = str(exc)
     m = _CODE_RE.search(text)
     # clickhouse-connect wraps the server text ("Received ClickHouse exception, code: N, server

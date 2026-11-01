@@ -189,3 +189,10 @@ def test_periods(name, start, end):
 def test_bad_period():
     with pytest.raises(ClickSenseError):
         resolve_period("when pigs fly")
+
+
+def test_metrics_named_verbatim_come_first(knowledge):
+    # "orders" names a metric word-for-word; "basket size" is a synonym of average_order_value.
+    assert knowledge.find_metrics("how many orders in Belgium last month")[0] == "orders"
+    assert knowledge.find_metrics("average basket by segment")[0] == "average_order_value"
+    assert knowledge.find_metrics("what were sales in France") == []  # ambiguous: left to the glossary
