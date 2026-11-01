@@ -280,7 +280,9 @@ clicksense-admin kb resolve shop.orders country France uk        # how words map
 ```
 
 Files under `semantic/` are picked up by the running server within seconds. The step-by-step
-recipes are in [docs/UPDATING.md](docs/UPDATING.md).
+recipes are in [docs/UPDATING.md](docs/UPDATING.md). To import an existing knowledge base (a folder
+of Markdown files) in one go, give an AI coding agent the prompt in
+[docs/PROMPT-import-knowledge.md](docs/PROMPT-import-knowledge.md).
 
 Configuration: every setting is documented in the code (`src/clicksense/config.py`) and in the
 generated `clicksense.example.yaml` (`clicksense-admin config --example`; `config --show` prints

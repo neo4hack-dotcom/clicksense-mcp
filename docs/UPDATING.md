@@ -376,6 +376,18 @@ again.
 
 ---
 
+## 12. Import a whole existing knowledge base
+
+If your knowledge already lives in Markdown files (wiki export, data catalogue, team notes), an AI
+coding agent can apply all the recipes above in one pass. Give it the prompt in
+[PROMPT-import-knowledge.md](PROMPT-import-knowledge.md) with the path of the folder: it inventories
+every file, maps each piece of information to its place in `semantic/`, checks it against ClickHouse,
+writes the entries from the templates, runs `kb validate --live` and test searches, and opens a pull
+request listing what it could not integrate and the conflicts to arbitrate. Review that pull request
+like any other change (recipe 10).
+
+---
+
 ## Appendix: what each command does
 
 | Command | Purpose |
