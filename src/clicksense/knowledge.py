@@ -84,13 +84,13 @@ def _load(text: str) -> Any:
 
 def _read_yaml(path: Path) -> Any:
     try:
-        return _load(path.read_text(encoding="utf-8")) or {}
+        return _load(path.read_text(encoding="utf-8-sig")) or {}
     except yaml.YAMLError as exc:
         raise ValueError(f"{path}: invalid YAML: {exc}") from None
 
 
 def _read_md(path: Path) -> tuple[dict[str, Any], str]:
-    text = path.read_text(encoding="utf-8")
+    text = path.read_text(encoding="utf-8-sig")
     m = _FRONT.match(text)
     if not m:
         return {}, text.strip()

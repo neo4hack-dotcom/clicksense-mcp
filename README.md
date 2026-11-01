@@ -44,10 +44,11 @@ cp clicksense.example.yaml clicksense.yaml
 ```
 
 `--check` prints the server state (connection, `readonly` level, limits, semantic-layer
-content). The 106 tests cover the guard (55 attacks), the offline semantic layer, the MCP
+content). The 131 tests cover the guard (55 attacks), the offline semantic layer, the MCP
 protocol and — when the local database is running — real integration (circuit breaker,
 cancellation, pre-flight estimate, ClickHouse limits).
-A scripted fake LLM covers the OpenAI-compatible bridge without any API key.
+A scripted fake LLM covers the OpenAI-compatible bridge without any API key, and
+`tests/test_windows_compat.py` pins the Windows rules (CRLF, ASCII, UTF-8 with BOM, tzdata...).
 
 ### Connect it to Claude Code / Claude Desktop
 
@@ -63,8 +64,8 @@ A scripted fake LLM covers the OpenAI-compatible bridge without any API key.
 ```
 
 Over HTTP (streamable, MCP protocol 2026-07-28): `clicksense --transport http --port 3110`
-→ `http://127.0.0.1:3110/mcp`. No built-in authentication: keep it on localhost or behind an
-authenticating proxy.
+→ `http://127.0.0.1:3110/mcp`. Beyond localhost a bearer token is required (see the Windows
+server section, it applies to any OS).
 
 ### Use it with an OpenAI-compatible LLM (your own API key)
 
@@ -104,6 +105,55 @@ async with connect(settings) as client:
     await agent.start()
     print(await agent.ask("What was revenue in France last month?"))
 ```
+
+## Install on a Windows server
+
+Same model as DOINg.AI: a local `.venv`, `pip install -r requirements.txt`, settings in `.env`,
+and batch scripts to double-click. ClickHouse itself stays where it is (Linux): the Windows
+server only needs network access to its HTTP port.
+
+**Prerequisite:** Python 3.11+ from python.org — tick *Add python.exe to PATH* and, on a server,
+*Install for all users* (the service account must be able to run it).
+
+```bat
+git clone https://github.com/neo4hack-dotcom/clicksense-mcp.git C:\clicksense
+cd C:\clicksense
+install-windows.bat
+```
+
+`install-windows.bat` checks Python, enables long paths (as Administrator), creates `.venv`,
+installs the dependencies, creates `clicksense.yaml` and `.env`, **generates a bearer token**
+for MCP clients, then runs a connection check. Then:
+
+1. Edit `.env`: `CLICKSENSE_HOST`, `CLICKSENSE_USER`, `CLICKSENSE_PASSWORD`, `CLICKSENSE_DATABASE`
+   (the read-only account from `dev/production-account.sql`), and `CLICKSENSE_HTTP_HOST=0.0.0.0`
+   if other machines must connect.
+2. `check-windows.bat` — connection, `readonly` level, tables.
+3. `serve-windows.bat` — the MCP server over HTTP in the foreground (`http://<server>:3110/mcp`).
+4. In an elevated PowerShell, run it at boot as a scheduled task (restarts on failure, log in
+   `logs\clicksense-http.log`; `-OpenFirewall` opens the port for the Domain/Private profiles):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\windows\service.ps1 install -OpenFirewall
+powershell -ExecutionPolicy Bypass -File scripts\windows\service.ps1 status
+```
+
+(`start`, `stop`, `restart`, `uninstall` too.) `chat-windows.bat` runs `clicksense-chat` with the
+LLM settings from `.env`. Offline networks: pip uses the mirror in `pip.ini`.
+
+**Security on a server.** The server refuses to listen beyond `127.0.0.1` without a token.
+Clients send `Authorization: Bearer <token>` (one of `CLICKSENSE_HTTP_TOKENS`, comma-separated,
+24+ characters; `clicksense --gen-token` makes one). Traffic is plain HTTP: for TLS, put the
+server behind your reverse proxy (IIS/ARR, nginx) or keep it on a trusted network.
+
+Connect a client to the Windows server:
+
+```json
+{"mcpServers": {"clicksense": {"url": "http://winserver:3110/mcp",
+                               "headers": {"Authorization": "Bearer <token>"}}}}
+```
+
+or from another machine with the chat bridge: `CLICKSENSE_MCP_TOKEN=<token> clicksense-chat --mcp-url http://winserver:3110/mcp`.
 
 ## What the agent sees
 
@@ -228,7 +278,7 @@ environment). Direct variables: `CLICKSENSE_HOST`, `CLICKSENSE_PORT`, `CLICKSENS
   knowable); ClickHouse then returns the error, translated with a hint.
 - Lexical search (BM25), no embeddings: deliberate (offline, fast), but a synonym missing from
   the dictionary will not be guessed.
-- No authentication on the HTTP transport.
+- HTTP auth is static bearer tokens (no OAuth, no TLS termination): use a reverse proxy for TLS.
 
 ## Code layout
 

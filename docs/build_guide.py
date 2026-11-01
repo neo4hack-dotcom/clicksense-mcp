@@ -332,14 +332,15 @@ code("""
 .venv/bin/clicksense --config clicksense.yaml --transport http --host 127.0.0.1 --port 3110
 # MCP endpoint: http://127.0.0.1:3110/mcp
 """)
-callout("Security", "The HTTP transport has no authentication. Bind it to localhost or put it behind an "
-        "authenticating reverse proxy.", WARN_SOFT, colors.HexColor("#c2410c"))
+callout("Security", "Beyond 127.0.0.1 the server requires a bearer token (section 2.8): set CLICKSENSE_HTTP_TOKENS "
+        "and clients send Authorization: Bearer &lt;token&gt;.", WARN_SOFT, colors.HexColor("#c2410c"))
 h2("2.6 Command-line reference")
 table([["Option", "Default", "Meaning"],
        ["--config PATH", "$CLICKSENSE_CONFIG or ./clicksense.yaml", "Configuration file."],
        ["--transport", "stdio", "stdio or http."],
        ["--host / --port", "127.0.0.1 / 3110", "HTTP bind address."],
-       ["--check", "off", "Print the status report and exit."]], [35, 60, 75])
+       ["--check", "off", "Print the status report and exit."],
+       ["--gen-token", "", "Print a new random bearer token and exit."]], [35, 60, 75])
 p("clicksense-chat takes --config, -q/--question, --model, --base-url, --mcp-url and --quiet (section 2.7).", SMALL)
 
 h2("2.7 Use an OpenAI-compatible LLM with your own API key")
@@ -376,7 +377,8 @@ from clicksense.agent import Agent, connect
 from clicksense.config import load_settings
 
 settings = load_settings("clicksense.yaml")
-async with connect(settings, ask_user=my_async_ask) as client:   # ask_user(question, options) -> str | None
+# ask_user(question, options) -> str | None is called for ask_user_to_clarify
+async with connect(settings, ask_user=my_async_ask) as client:
     agent = Agent(settings.llm, client, on_event=lambda kind, data: print(kind, data))
     await agent.start()
     answer = await agent.ask("What was revenue in France last month?")
@@ -385,6 +387,53 @@ callout("Data leaves your network", "Tool results (schema, sampled values, query
         "provider you configure. Use a provider and contract that fit the data's sensitivity, or a local server "
         "(vLLM, Ollama with a local model). PII columns are never returned raw by ClickSense under policy pii: block.",
         WARN_SOFT, colors.HexColor("#c2410c"))
+
+h2("2.8 Install on a Windows server")
+p("Same model as DOINg.AI: a local .venv, <font face='Courier'>pip install -r requirements.txt</font>, settings in "
+  "<font face='Courier'>.env</font> and batch scripts. ClickHouse stays where it is; the Windows server only needs "
+  "network access to its HTTP port. Prerequisite: Python 3.11+ from python.org with <i>Add python.exe to PATH</i> and, "
+  "on a server, <i>Install for all users</i> so the service account can run it.")
+code("""
+git clone https://github.com/neo4hack-dotcom/clicksense-mcp.git C:\\clicksense
+cd C:\\clicksense
+install-windows.bat
+""")
+table([["Script", "What it does"],
+       ["install-windows.bat", "Checks Python, enables long paths (as Administrator), creates .venv, installs "
+        "requirements.txt and the package, creates clicksense.yaml and .env, generates a bearer token in .env, runs "
+        "the connection check. Safe to re-run: existing configuration is never overwritten."],
+       ["check-windows.bat", "Connection, readonly level, limits, tables, semantic layer. Changes nothing."],
+       ["serve-windows.bat", "The MCP server over HTTP in the foreground. Extra arguments pass through "
+        "(e.g. --host 0.0.0.0)."],
+       ["chat-windows.bat", "clicksense-chat with the LLM settings from .env."],
+       ["scripts\\windows\\service.ps1", "install | status | start | stop | restart | uninstall a scheduled task that "
+        "runs serve-windows.bat at boot under SYSTEM (or -User with a domain account), restarts it on failure and "
+        "appends to logs\\clicksense-http.log. -OpenFirewall adds an inbound rule (Domain, Private)."]], [42, 128])
+code("""
+:: elevated PowerShell
+powershell -ExecutionPolicy Bypass -File scripts\\windows\\service.ps1 install -OpenFirewall
+powershell -ExecutionPolicy Bypass -File scripts\\windows\\service.ps1 status
+""")
+table([["Variable (.env)", "Meaning"],
+       ["CLICKSENSE_HOST / _PORT / _USER / _PASSWORD / _DATABASE / _SECURE", "ClickHouse connection (read-only account)."],
+       ["CLICKSENSE_HTTP_HOST / _PORT", "Bind address (127.0.0.1 = this machine only; 0.0.0.0 = network) and port."],
+       ["CLICKSENSE_HTTP_TOKENS", "Accepted bearer tokens, comma-separated, 24+ characters (clicksense --gen-token)."],
+       ["OPENAI_API_KEY / OPENAI_BASE_URL / CLICKSENSE_LLM_MODEL", "LLM for clicksense-chat."],
+       ["CLICKSENSE_MCP_TOKEN", "Token clicksense-chat sends when --mcp-url points at a remote server."]], [70, 100])
+callout("Security", "The server refuses to listen beyond 127.0.0.1 without a token, and rejects tokens shorter than "
+        "24 characters. Tokens are compared in constant time; a request without a valid "
+        "<font face='Courier'>Authorization: Bearer</font> header gets 401 before reaching any tool. Traffic is plain "
+        "HTTP: for TLS, put the server behind a reverse proxy (IIS/ARR, nginx) or keep it on a trusted network.",
+        WARN_SOFT, colors.HexColor("#c2410c"))
+p("Windows-specific details handled for you: CRLF line endings and ASCII-only scripts (cmd.exe and PowerShell 5.1), "
+  "UTF-8 with or without the BOM Notepad adds (config, .env, semantic files), <font face='Courier'>PYTHONUTF8=1</font> "
+  "for console output, <font face='Courier'>tzdata</font> for time zones, no <font face='Courier'>--reload</font>. "
+  "tests/test_windows_compat.py checks these rules from any OS.")
+p("A remote MCP client connects with the URL and the header:")
+code("""
+{"mcpServers": {"clicksense": {"url": "http://winserver:3110/mcp",
+                               "headers": {"Authorization": "Bearer <token>"}}}}
+""")
 
 # ============================================================================== 3 configuration
 h1("3. Configuration")
@@ -445,7 +494,13 @@ table([["Key", "Default", "Meaning"],
        ["pii", "block", "block: PII columns may be filtered or aggregated but never returned raw. allow: no restriction."],
        ["server_parse_fallback", "true", "If sqlglot cannot parse valid ClickHouse SQL, ask ClickHouse (EXPLAIN AST)."]],
       [45, 38, 87])
-h2("3.4 Other keys")
+h2("3.4 http")
+table([["Key", "Default", "Meaning"],
+       ["host / port", "127.0.0.1 / 3110", "Also CLICKSENSE_HTTP_HOST / CLICKSENSE_HTTP_PORT."],
+       ["tokens", "[]", "Bearer tokens; also CLICKSENSE_HTTP_TOKENS (comma-separated). Required beyond loopback."],
+       ["allow_unauthenticated_remote", "false", "Explicit opt-out of the token requirement (not recommended)."]],
+      [50, 35, 85])
+h2("3.5 Other keys")
 table([["Key", "Default", "Meaning"],
        ["semantic_dir", "semantic", "Location of the semantic layer."],
        ["audit_path", "audit/clicksense.jsonl", "JSONL audit log; null disables it."],
@@ -455,7 +510,7 @@ table([["Key", "Default", "Meaning"],
        ["value_scan_max_rows", "5e7", "Larger tables are sampled or time-windowed when enumerating values."]],
       [45, 45, 80])
 
-h2("3.5 llm (clicksense-chat)")
+h2("3.6 llm (clicksense-chat)")
 table([["Key", "Default", "Meaning"],
        ["base_url", "$OPENAI_BASE_URL or OpenAI", "OpenAI-compatible endpoint."],
        ["api_key", "env", "Prefer OPENAI_API_KEY / CLICKSENSE_LLM_API_KEY in the environment or .env."],
@@ -1023,16 +1078,20 @@ table([["File", "Covers"],
        ["tests/test_semantic.py", "Loader, search, glossary, resolver statuses, metric compiler, periods — offline."],
        ["tests/test_mcp.py", "readOnlyHint on every tool, isError on refusals, resources, prompts, native skills, "
         "elicitation with and without client support."],
+       ["tests/test_http.py", "HTTP transport: 401 without or with a wrong token, access with the right one, bind "
+        "policy, chat bridge against a remote server."],
+       ["tests/test_windows_compat.py", "Windows rules checked from any OS: CRLF + ASCII scripts, .gitattributes, "
+        "PYTHONUTF8, no --reload, requirements vs pyproject, tzdata, UTF-8 BOM, .env precedence."],
        ["tests/test_agent.py", "The OpenAI-compatible bridge with a scripted fake LLM: tool mapping, auto-context, "
         "refusals and bad arguments, clarification, step limit."],
        ["tests/test_live.py", "Against the demo database: limits, account boundary, pre-flight, breaker, slots, "
         "cancellation, cache, end-to-end tools, audit content. Skipped when ClickHouse is down."]], [42, 128])
 h2("12.2 Known limits")
 bullets(["The guard is defence in depth, not a security boundary (section 9).",
+         "HTTP auth is static bearer tokens; TLS is left to a reverse proxy.",
          "EXPLAIN ESTIMATE covers MergeTree tables only; other engines are not pre-estimated (limits still apply).",
          "Column linting is skipped for queries over subqueries or CTEs; ClickHouse's error is translated instead.",
          "Search is lexical (BM25) and offline: a synonym missing from the dictionary will not be guessed.",
-         "No authentication on the HTTP transport.",
          "Metrics combine only when they share a table and built-in filters."])
 h2("12.3 FAQ")
 for q, a in [

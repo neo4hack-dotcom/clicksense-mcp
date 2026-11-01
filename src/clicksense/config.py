@@ -83,6 +83,25 @@ class Policy(BaseModel):
     server_parse_fallback: bool = True
 
 
+class Http(BaseModel):
+    """The streamable-HTTP transport (`clicksense --transport http`), for remote MCP clients.
+
+    Listening on anything but loopback requires at least one bearer token: an MCP endpoint on the
+    network without authentication would hand the warehouse to anyone who can reach the port."""
+
+    host: str = "127.0.0.1"
+    port: int = 3110
+    tokens: list[str] = Field(default_factory=list)  # also $CLICKSENSE_HTTP_TOKENS, comma-separated
+    allow_unauthenticated_remote: bool = False
+
+    @field_validator("tokens", mode="before")
+    @classmethod
+    def _split(cls, v):
+        if isinstance(v, str):
+            v = v.split(",")
+        return [t.strip() for t in (v or []) if t and t.strip()]
+
+
 class LLM(BaseModel):
     """Any OpenAI-compatible chat-completions endpoint, for `clicksense-chat` (OpenAI, Azure OpenAI,
     Mistral, Groq, DeepSeek, OpenRouter, vLLM, Ollama, LM Studio...). The key is read from
@@ -100,12 +119,14 @@ class LLM(BaseModel):
     timeout_s: float = 120
     extra_headers: dict[str, str] = Field(default_factory=dict)
     mcp_url: str | None = None  # None: run ClickSense in-process; else e.g. http://127.0.0.1:3110/mcp
+    mcp_token: str | None = None  # bearer token for mcp_url; also $CLICKSENSE_MCP_TOKEN
 
 
 class Settings(BaseModel):
     connection: Connection = Field(default_factory=Connection)
     limits: Limits = Field(default_factory=Limits)
     policy: Policy = Field(default_factory=Policy)
+    http: Http = Field(default_factory=Http)
     llm: LLM = Field(default_factory=LLM)
     semantic_dir: Path = Path("semantic")
     audit_path: Path | None = Path("audit/clicksense.jsonl")
@@ -149,22 +170,47 @@ _ENV_OVERRIDES = {
 }
 
 
+def load_dotenv(*dirs: Path) -> None:
+    """KEY=value lines from `.env` in these directories; variables already set win. No dependency,
+    and the same file works on Windows and Unix (a .env is easier to edit than system variables)."""
+    for d in dirs:
+        f = d / ".env"
+        if not f.is_file():
+            continue
+        for line in f.read_text(encoding="utf-8-sig").splitlines():  # -sig: Notepad's UTF-8 BOM
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.removeprefix("export ").partition("=")
+            os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+
+
 def load_settings(path: str | Path | None = None) -> Settings:
     candidate = path or os.environ.get("CLICKSENSE_CONFIG")
     if candidate is None and Path("clicksense.yaml").exists():
         candidate = "clicksense.yaml"
+    # .env next to the config, then in the working directory, before ${VAR} substitution.
+    load_dotenv(*([Path(candidate).expanduser().resolve().parent] if candidate else []), Path.cwd())
     raw: dict = {}
     base = Path.cwd()
     if candidate:
         p = Path(candidate).expanduser()
         if not p.exists():
             raise ConfigError(f"config file not found: {p}")
-        raw = _subst(yaml.safe_load(p.read_text()) or {})
+        raw = _subst(yaml.safe_load(p.read_text(encoding="utf-8-sig")) or {})  # explicit: Windows defaults to cp1252
         base = p.resolve().parent
     conn = raw.setdefault("connection", {})
     for env, key in _ENV_OVERRIDES.items():
         if env in os.environ:
             conn[key] = os.environ[env]
+    http = raw.setdefault("http", {})
+    for env, key in (("CLICKSENSE_HTTP_HOST", "host"), ("CLICKSENSE_HTTP_PORT", "port"),
+                     ("CLICKSENSE_HTTP_TOKENS", "tokens")):
+        if os.environ.get(env):
+            http[key] = os.environ[env]
+    llm = raw.setdefault("llm", {})
+    if os.environ.get("CLICKSENSE_MCP_TOKEN") and not llm.get("mcp_token"):
+        llm["mcp_token"] = os.environ["CLICKSENSE_MCP_TOKEN"]
     settings = Settings.model_validate(raw)
     # Relative paths are relative to the config file, not to wherever the client spawned us.
     if not settings.semantic_dir.is_absolute():

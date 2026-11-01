@@ -34,6 +34,12 @@ policy:
   pii: block                  # PII columns can be filtered/aggregated, never returned raw
   server_parse_fallback: true
 
+# MCP over HTTP (clicksense --transport http, serve-windows.bat). Tokens come from
+# $CLICKSENSE_HTTP_TOKENS (.env); listening beyond 127.0.0.1 requires at least one.
+http:
+  host: ${CLICKSENSE_HTTP_HOST:-127.0.0.1}
+  port: ${CLICKSENSE_HTTP_PORT:-3110}
+
 semantic_dir: semantic
 audit_path: audit/clicksense.jsonl
 catalog_ttl_s: 600

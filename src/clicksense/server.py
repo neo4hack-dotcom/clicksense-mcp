@@ -94,9 +94,26 @@ def _call(fn, *args, **kwargs):
         return _err(exc)
 
 
-def build_app(settings: Settings | None = None, service: ClickSense | None = None) -> FastMCP:
+def bearer_auth(tokens: list[str]):
+    """Static bearer tokens, compared in constant time. Each MCP client sends
+    `Authorization: Bearer <token>`; anything else gets 401 before reaching a tool."""
+    import hmac
+
+    from fastmcp.server.auth.providers.debug import DebugTokenVerifier
+
+    expected = [t.encode() for t in tokens]
+
+    def valid(token: str) -> bool:
+        given = token.encode()
+        return any(hmac.compare_digest(given, t) for t in expected)
+
+    return DebugTokenVerifier(validate=valid, client_id="clicksense-token")
+
+
+def build_app(settings: Settings | None = None, service: ClickSense | None = None, *,
+              auth: Any = None) -> FastMCP:
     cs = service or ClickSense(settings or load_settings())
-    mcp = FastMCP("clicksense", instructions=INSTRUCTIONS, version="1.0.0")
+    mcp = FastMCP("clicksense", instructions=INSTRUCTIONS, version="1.0.0", auth=auth)
     mcp.clicksense = cs  # type: ignore[attr-defined]  # handy for tests and embedding
 
     # ------------------------------------------------------------------ discovery
@@ -373,26 +390,57 @@ def _register_skill_prompt(mcp: FastMCP, cs: ClickSense, name: str, description:
     mcp.prompt(name=f"skill-{name}", description=description or f"Skill {name}")(prompt)
 
 
+LOOPBACK = {"127.0.0.1", "localhost", "::1"}
+MIN_TOKEN_CHARS = 24
+
+
+def http_auth_or_exit(http, host: str) -> Any:
+    """Auth for the HTTP transport, or exit with a clear message when the setup is unsafe."""
+    weak = [t for t in http.tokens if len(t) < MIN_TOKEN_CHARS]
+    if weak:
+        _die(f"HTTP tokens must be at least {MIN_TOKEN_CHARS} characters. Generate one with: clicksense --gen-token")
+    if http.tokens:
+        return bearer_auth(http.tokens)
+    if host not in LOOPBACK and not http.allow_unauthenticated_remote:
+        _die(f"Refusing to listen on {host} without authentication. Set CLICKSENSE_HTTP_TOKENS in .env "
+             "(generate one with: clicksense --gen-token), or listen on 127.0.0.1.")
+    return None
+
+
+def _die(message: str) -> None:
+    print(f"clicksense: {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="clicksense", description="ClickHouse semantic MCP server")
     ap.add_argument("--config", help="Path to clicksense.yaml (default: $CLICKSENSE_CONFIG or ./clicksense.yaml)")
     ap.add_argument("--transport", choices=["stdio", "http"], default="stdio")
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=3110)
+    ap.add_argument("--host", help="HTTP bind address (default: http.host, 127.0.0.1)")
+    ap.add_argument("--port", type=int, help="HTTP port (default: http.port, 3110)")
     ap.add_argument("--check", action="store_true", help="Validate config + connectivity, print status, exit")
+    ap.add_argument("--gen-token", action="store_true", help="Print a new random bearer token and exit")
     args = ap.parse_args(argv)
+    if args.gen_token:
+        import secrets
+
+        print(secrets.token_urlsafe(32))
+        return
     try:
         settings = load_settings(args.config)
     except ConfigError as exc:
-        print(f"clicksense: {exc}", file=sys.stderr)
-        raise SystemExit(2)
+        _die(str(exc))
     service = ClickSense(settings)
     if args.check:
         service.catalog.refresh()  # the catalog is lazy; load it so the report shows real table counts
         print(json.dumps(service.status(), indent=2, default=str))
         return
-    app = build_app(settings, service)
     if args.transport == "http":
-        app.run(transport="http", host=args.host, port=args.port)
+        host = args.host or settings.http.host
+        port = args.port or settings.http.port
+        auth = http_auth_or_exit(settings.http, host)
+        print(f"clicksense: MCP endpoint http://{host}:{port}/mcp  (auth: "
+              f"{'bearer token' if auth else 'none, loopback only'})", file=sys.stderr)
+        build_app(settings, service, auth=auth).run(transport="http", host=host, port=port)
     else:
-        app.run(transport="stdio", show_banner=False)
+        build_app(settings, service).run(transport="stdio", show_banner=False)
